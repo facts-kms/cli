@@ -825,7 +825,11 @@ enum Command {
         #[arg(long, help = "Use a particular local ledger")]
         ledger: Option<String>,
     },
-    #[command(about = "Review and act on discussion invitations", display_order = 65)]
+    #[command(
+        hide = true,
+        about = "Review and act on discussion invitations",
+        display_order = 0
+    )]
     Invitations {
         #[command(subcommand)]
         command: Option<InvitationsCommand>,
@@ -2757,11 +2761,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let environment = UserEnvironment::discover()?;
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
-            let initial = if file.is_none() && message.is_none() {
-                Some(resolve_latest_user_content(&entry, &reference)?)
-            } else {
-                None
-            };
+            let initial = Some(resolve_latest_user_content(&entry, &reference)?);
             let markdown =
                 read_or_edit_markdown_with_initial(file, message.as_deref(), initial.as_deref())?;
             if initial.as_deref() == Some(markdown.as_slice()) {
@@ -5464,7 +5464,6 @@ Discussion and Decisions:
   comment         Add a comment to a proposition or its discussion
   comments        List comments attached to a proposition or revision
   invite          Invite someone to join a proposition's discussion
-  invitations     Review and act on discussion invitations
   join            Join a discussion using an invitation
   leave           Leave a proposition's discussion
   pending         List propositions that still need a decision
