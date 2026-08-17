@@ -1,0 +1,154 @@
+name: Facts CLI
+
+env:
+  FACTS_SDK_REPOSITORY: https://github.com/facts-kms/sdk.git
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - '**'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    container: rust:1.88-bookworm
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+          git --version
+          cargo --version
+          rustup component add rustfmt clippy
+          cargo fmt --version
+          cargo clippy --version
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: cli
+      - name: Trust checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/cli"
+      - name: Checkout Facts SDK
+        run: git clone --depth 1 "$FACTS_SDK_REPOSITORY" "$GITHUB_WORKSPACE/sdk"
+      - name: Run lint
+        working-directory: cli
+        run: ./run deploy phase lint
+
+  test:
+    runs-on: ubuntu-latest
+    container: rust:1.88-bookworm
+    needs:
+      - lint
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+          git --version
+          cargo --version
+          rustup component add rustfmt clippy
+          cargo fmt --version
+          cargo clippy --version
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: cli
+      - name: Trust checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/cli"
+      - name: Checkout Facts SDK
+        run: git clone --depth 1 "$FACTS_SDK_REPOSITORY" "$GITHUB_WORKSPACE/sdk"
+      - name: Run test
+        working-directory: cli
+        run: ./run deploy phase test
+
+  build:
+    runs-on: ubuntu-latest
+    container: rust:1.88-bookworm
+    needs:
+      - test
+    if: contains(github.ref_name, '-build-')
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+          git --version
+          cargo --version
+          rustup component add rustfmt clippy
+          cargo fmt --version
+          cargo clippy --version
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: cli
+      - name: Trust checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/cli"
+      - name: Checkout Facts SDK
+        run: git clone --depth 1 "$FACTS_SDK_REPOSITORY" "$GITHUB_WORKSPACE/sdk"
+      - name: Run build
+        working-directory: cli
+        run: ./run deploy phase build
+
+  release:
+    runs-on: ubuntu-latest
+    container: rust:1.88-bookworm
+    needs:
+      - test
+    if: contains(github.ref_name, '-release-')
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+          git --version
+          cargo --version
+          rustup component add rustfmt clippy
+          cargo fmt --version
+          cargo clippy --version
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: cli
+      - name: Trust checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/cli"
+      - name: Checkout Facts SDK
+        run: git clone --depth 1 "$FACTS_SDK_REPOSITORY" "$GITHUB_WORKSPACE/sdk"
+      - name: Run release
+        working-directory: cli
+        run: ./run deploy phase release
+
+  deploy:
+    runs-on: ubuntu-latest
+    container: rust:1.88-bookworm
+    needs:
+      - test
+    if: contains(github.ref_name, '-deploy-')
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+          git --version
+          cargo --version
+          rustup component add rustfmt clippy
+          cargo fmt --version
+          cargo clippy --version
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: cli
+      - name: Trust checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/cli"
+      - name: Checkout Facts SDK
+        run: git clone --depth 1 "$FACTS_SDK_REPOSITORY" "$GITHUB_WORKSPACE/sdk"
+      - name: Run deploy
+        working-directory: cli
+        run: ./run deploy phase deploy

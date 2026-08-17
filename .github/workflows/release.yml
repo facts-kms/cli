@@ -1,0 +1,138 @@
+name: Facts CLI Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+env:
+  FACTS_SDK_REPOSITORY: https://github.com/facts-kms/sdk.git
+  RUST_TOOLCHAIN: 1.88.0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-binaries:
+    name: Build ${{ matrix.asset_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            asset_name: fact-linux-x86_64
+            binary_name: fact
+            archive: tar.gz
+
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset_name: fact-linux-aarch64
+            binary_name: fact
+            archive: tar.gz
+
+          - runner: macos-26-intel
+            target: x86_64-apple-darwin
+            asset_name: fact-macos-x86_64
+            binary_name: fact
+            archive: tar.gz
+
+          - runner: macos-26
+            target: aarch64-apple-darwin
+            asset_name: fact-macos-aarch64
+            binary_name: fact
+            archive: tar.gz
+
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            asset_name: fact-windows-x86_64
+            binary_name: fact.exe
+            archive: zip
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout CLI
+        uses: actions/checkout@v4
+        with:
+          path: cli
+
+      - name: Checkout Facts SDK
+        run: git clone --depth 1 "$FACTS_SDK_REPOSITORY" "$GITHUB_WORKSPACE/sdk"
+
+      - name: Trust CLI checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/cli"
+
+      - name: Trust SDK checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/sdk"
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustup target add "${{ matrix.target }}"
+          cargo --version
+
+      - name: Build binary
+        working-directory: cli
+        run: cargo build --release --bin fact --target "${{ matrix.target }}" --locked
+
+      - name: Verify binary
+        working-directory: cli
+        run: "target/${{ matrix.target }}/release/${{ matrix.binary_name }} --version"
+
+      - name: Package Unix binary
+        if: matrix.archive == 'tar.gz'
+        working-directory: cli
+        run: |
+          mkdir -p "dist/${{ matrix.asset_name }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "dist/${{ matrix.asset_name }}/"
+          tar -C dist -czf "dist/${{ matrix.asset_name }}.tar.gz" "${{ matrix.asset_name }}"
+
+      - name: Package Windows binary
+        if: matrix.archive == 'zip'
+        working-directory: cli
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/${{ matrix.asset_name }}"
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "dist/${{ matrix.asset_name }}/"
+          Compress-Archive -Path "dist/${{ matrix.asset_name }}" -DestinationPath "dist/${{ matrix.asset_name }}.zip"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            cli/dist/${{ matrix.asset_name }}.tar.gz
+            cli/dist/${{ matrix.asset_name }}.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release:
+    name: Publish GitHub Release
+    needs:
+      - build-binaries
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+          fi
