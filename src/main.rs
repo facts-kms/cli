@@ -2093,7 +2093,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|name| name.as_str())
                 .unwrap_or("ledger");
             let human = if value.get("report").and_then(|report| report.as_bool()) == Some(true) {
-                format!("current signer for ledger {ledger}: {actor}")
+                if value.get("actor").is_some_and(serde_json::Value::is_null) {
+                    let suffix = if value
+                        .get("ledger")
+                        .and_then(|ledger| ledger.get("read_only"))
+                        .and_then(|read_only| read_only.as_bool())
+                        == Some(true)
+                    {
+                        " (read-only)"
+                    } else {
+                        ""
+                    };
+                    format!("no current signer for ledger {ledger}{suffix}")
+                } else {
+                    format!("current signer for ledger {ledger}: {actor}")
+                }
             } else if value
                 .get("self")
                 .and_then(|self_value| self_value.as_bool())
@@ -6031,6 +6045,27 @@ mod fact_as {
         ledger_name: &str,
         entry: &LedgerEntry,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        if entry.actor_id.is_empty() || entry.key_id.is_empty() {
+            return Ok(serde_json::json!({
+                "report":true,
+                "switched":false,
+                "self":false,
+                "created_identity":false,
+                "created_directory_entry":false,
+                "updated_directory_entry":false,
+                "created_home":false,
+                "created_permission_grants":[],
+                "ledger":{
+                    "name":ledger_name,
+                    "ledger_id":entry.ledger_id,
+                    "database":entry.database,
+                    "read_only":entry.read_only
+                },
+                "actor":null,
+                "no_current_signer":true,
+                "home":null
+            }));
+        }
         let actor_id = uuid::Uuid::parse_str(&entry.actor_id)?;
         let key_id = uuid::Uuid::parse_str(&entry.key_id)?;
         let directory =
@@ -6058,7 +6093,8 @@ mod fact_as {
             "ledger":{
                 "name":ledger_name,
                 "ledger_id":entry.ledger_id,
-                "database":entry.database
+                "database":entry.database,
+                "read_only":entry.read_only
             },
             "actor":{
                 "actor_id":actor_id,
