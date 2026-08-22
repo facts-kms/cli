@@ -8,6 +8,7 @@ use std::{
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitCode, Stdio},
+    sync::Arc,
 };
 
 struct UserMessage(String);
@@ -582,15 +583,30 @@ enum Command {
         name: Option<String>,
     },
     #[command(
-        hide = true,
         about = "Copy a shared ledger into a read-only local ledger",
-        display_order = 0
+        display_order = 18
     )]
     Clone {
-        #[arg(help = "A local bundle path or remote URL to copy")]
-        source: String,
-        #[arg(long, help = "The ledger ID to copy when the source is a remote URL")]
+        #[arg(
+            help = "A local bundle path or remote URL to copy",
+            required_unless_present = "remote"
+        )]
+        source: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "source",
+            help = "The configured remote to copy"
+        )]
+        remote: Option<String>,
+        #[arg(long, help = "The ledger ID to copy when the source is remote")]
         ledger: Option<String>,
+        #[arg(long, help = "A friendly local name for the cloned ledger")]
+        name: Option<String>,
+        #[arg(
+            long = "as",
+            help = "Bind the cloned ledger to an existing local identity"
+        )]
+        actor: Option<String>,
     },
     #[command(
         hide = true,
@@ -1298,6 +1314,14 @@ enum Command {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    #[command(
+        about = "Run and administer a Facts HTTP collaboration server",
+        display_order = 55
+    )]
+    Http {
+        #[command(subcommand)]
+        command: HttpCommand,
+    },
     #[command(hide = true, about = "Manage local ledgers and their configuration")]
     Ledger {
         #[command(subcommand)]
@@ -1447,8 +1471,8 @@ enum IdentityCommand {
     },
     #[command(about = "Export identity keys for backup or transfer")]
     Export {
-        #[arg(help = "Where to write the identity key material")]
-        output: PathBuf,
+        #[arg(value_name = "FILE", help = "Where to write the identity key material")]
+        file: Option<PathBuf>,
         #[arg(long, help = "Use a particular local ledger")]
         ledger: Option<String>,
     },
@@ -1513,6 +1537,26 @@ enum DirectoryCommand {
         verified_by: Option<String>,
         #[arg(long, help = "Create a new local identity and name it")]
         with_identity: bool,
+        #[arg(long, help = "Also issue an HTTP bearer token for this actor")]
+        with_token: bool,
+        #[arg(
+            long,
+            requires = "with_token",
+            help = "Token expiry in days when using --with-token"
+        )]
+        token_expires_days: Option<i64>,
+        #[arg(
+            long,
+            requires = "with_token",
+            help = "Operator label for the token created by --with-token"
+        )]
+        token_label: Option<String>,
+        #[arg(
+            long,
+            requires = "with_token",
+            help = "Path to the server token SQLite database"
+        )]
+        token_store: Option<PathBuf>,
         #[arg(long, help = "Use a particular local ledger")]
         ledger: Option<String>,
     },
@@ -1667,7 +1711,79 @@ enum RemoteCommand {
         #[arg(help = "The new remote name")]
         new_name: String,
     },
+    #[command(about = "Remember or clear the bearer token used for a remote")]
+    Auth {
+        #[arg(help = "The configured remote name")]
+        name: String,
+        #[arg(long, help = "Read the bearer token from stdin")]
+        stdin: bool,
+        #[arg(
+            long,
+            conflicts_with = "stdin",
+            help = "Forget the remote bearer token"
+        )]
+        clear: bool,
+        #[arg(help = "The bearer token to remember")]
+        token: Option<String>,
+    },
 }
+
+#[derive(Subcommand)]
+enum HttpCommand {
+    #[command(about = "Serve a local ledger over the Facts HTTP transport")]
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:8787", help = "Address to bind")]
+        bind: String,
+        #[arg(long, help = "Use a particular local ledger")]
+        ledger: Option<String>,
+        #[arg(long, help = "Serve every writable local ledger in the catalog")]
+        all: bool,
+        #[arg(long, help = "Override the public API root URL")]
+        api_root: Option<String>,
+        #[arg(long, help = "Path to the server token SQLite database")]
+        token_store: Option<PathBuf>,
+    },
+    #[command(about = "Manage HTTP bearer tokens")]
+    Token {
+        #[command(subcommand)]
+        command: HttpTokenCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum HttpTokenCommand {
+    #[command(about = "Issue an opaque bearer token for an existing actor")]
+    Issue {
+        #[arg(long, help = "Actor ID; defaults to the active ledger actor")]
+        actor: Option<String>,
+        #[arg(long, help = "Ledger ID; defaults to the active ledger")]
+        ledger: Option<String>,
+        #[arg(long, help = "Token expiry in days")]
+        expires_days: Option<i64>,
+        #[arg(long, help = "Operator label for this token")]
+        label: Option<String>,
+        #[arg(long, help = "Path to the server token SQLite database")]
+        token_store: Option<PathBuf>,
+    },
+    #[command(about = "List issued HTTP bearer token metadata")]
+    List {
+        #[arg(long, help = "Path to the server token SQLite database")]
+        token_store: Option<PathBuf>,
+    },
+    #[command(about = "Revoke an issued HTTP bearer token by token ID")]
+    Revoke {
+        #[arg(help = "The token ID to revoke")]
+        token_id: String,
+        #[arg(long, help = "Path to the server token SQLite database")]
+        token_store: Option<PathBuf>,
+    },
+    #[command(about = "Delete expired or revoked HTTP bearer token metadata")]
+    Prune {
+        #[arg(long, help = "Path to the server token SQLite database")]
+        token_store: Option<PathBuf>,
+    },
+}
+
 #[derive(Subcommand)]
 enum LedgerCommand {
     #[command(about = "Import a bundle as a named read-only ledger")]
@@ -1867,6 +1983,8 @@ enum SyncCommand {
         remote: Option<String>,
         #[arg(long, help = "The ledger to send")]
         ledger: Option<String>,
+        #[arg(long, hide = true)]
+        bearer_token: Option<String>,
     },
     #[command(about = "Pull a bundle or remote into a database")]
     Pull {
@@ -1886,6 +2004,8 @@ enum SyncCommand {
         max_object_bytes: Option<usize>,
         #[arg(long, help = "The configured remote to fetch data from")]
         remote: Option<String>,
+        #[arg(long, hide = true)]
+        bearer_token: Option<String>,
     },
     #[command(about = "Retry importing a previously deferred object bundle")]
     Retry {
@@ -2232,11 +2352,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 message,
             );
         }
-        Command::Clone { source, ledger } => {
+        Command::Clone {
+            source,
+            remote,
+            ledger,
+            name,
+            actor,
+        } => {
             let environment = UserEnvironment::discover()?;
-            let ledger_id = environment::clone_source_ledger_id(&source, ledger.as_deref())?;
-            let name = environment::clone_source_name(&environment, &source)?;
-            let entry = clone_read_only_ledger(&environment, &name, &source, &ledger_id)?;
+            let source = clone_source_from_args(&environment, source, remote)?;
+            let ledger_id = environment::clone_source_ledger_id(&source.url, ledger.as_deref())?;
+            let name = match name {
+                Some(name) => name,
+                None => environment::clone_source_name(&environment, &source.name_source)?,
+            };
+            let actor = actor
+                .as_deref()
+                .map(|actor| clone_actor_binding(&environment, actor))
+                .transpose()?;
+            let entry = clone_read_only_ledger(&environment, &name, &source, &ledger_id, actor)?;
+            let remote_json = source
+                .remote_name
+                .as_deref()
+                .map(|name| serde_json::Value::String(name.to_owned()))
+                .unwrap_or_else(|| {
+                    if source.is_remote_url {
+                        serde_json::Value::String(source.url.clone())
+                    } else {
+                        serde_json::Value::Null
+                    }
+                });
             environment.set_active(&name)?;
             print_json_or(
                 cli.json,
@@ -2244,10 +2389,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "cloned":true,
                     "name":entry.name,
                     "ledger_id":entry.ledger_id,
-                    "read_only":true,
-                    "active":true
+                    "read_only":entry.read_only,
+                    "active":true,
+                    "remote":remote_json,
+                    "actor_id":if entry.actor_id.is_empty() {serde_json::Value::Null} else {serde_json::Value::String(entry.actor_id.clone())},
+                    "key_id":if entry.key_id.is_empty() {serde_json::Value::Null} else {serde_json::Value::String(entry.key_id.clone())}
                 }),
-                format!("cloned read-only ledger {}", entry.name),
+                if entry.read_only {
+                    format!("cloned read-only ledger {}", entry.name)
+                } else {
+                    format!(
+                        "cloned writable ledger {} as {}",
+                        entry.name, entry.actor_id
+                    )
+                },
             );
         }
         Command::From {
@@ -3591,6 +3746,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     source,
                     verified_by,
                     with_identity,
+                    with_token,
+                    token_expires_days,
+                    token_label,
+                    token_store,
                     ledger,
                 },
         } => {
@@ -3641,10 +3800,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .join(format!("{}.seed", result.actor_id));
                 environment.write_seed(&seed_file, &identity_seed)?;
             }
+            let access_token = if with_token {
+                Some(issue_http_actor_token(
+                    &environment,
+                    &entry,
+                    result.actor_id,
+                    token_expires_days,
+                    token_label,
+                    token_store,
+                )?)
+            } else {
+                None
+            };
+            let mut value = serde_json::to_value(&result)?;
+            if let Some(access_token) = &access_token {
+                value["access_token"] = access_token_json(access_token);
+            }
             print_json_or(
                 cli.json,
-                serde_json::to_value(&result)?,
-                format!("added {} as {}", result.display_name, result.actor_ref),
+                value,
+                if let Some(access_token) = access_token {
+                    format!(
+                        "added {} as {}\nissued token {}\n{}",
+                        result.display_name,
+                        result.actor_ref,
+                        access_token.issued.record.token_id,
+                        access_token.issued.token
+                    )
+                } else {
+                    format!("added {} as {}", result.display_name, result.actor_ref)
+                },
             );
         }
         Command::Directory {
@@ -3903,6 +4088,119 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 format!("renamed remote {old_name} to {new_name}"),
             );
         }
+        Command::Remote {
+            command:
+                RemoteCommand::Auth {
+                    name,
+                    stdin,
+                    clear,
+                    token,
+                },
+        } => {
+            let environment = UserEnvironment::discover()?;
+            let bearer_token =
+                if clear {
+                    None
+                } else if stdin {
+                    let mut value = String::new();
+                    io::stdin().read_to_string(&mut value)?;
+                    Some(value.trim().to_owned())
+                } else {
+                    Some(token.ok_or_else(|| {
+                        user_error("remote auth requires TOKEN, --stdin, or --clear")
+                    })?)
+                };
+            let result = environment::set_remote_bearer_token(&environment, &name, bearer_token)?;
+            print_json_or(
+                cli.json,
+                serde_json::json!({"authenticated":!clear,"name":result.name,"scope":result.scope}),
+                if clear {
+                    format!("cleared auth for remote {name}")
+                } else {
+                    format!("stored auth for remote {name}")
+                },
+            );
+        }
+        Command::Http {
+            command:
+                HttpCommand::Serve {
+                    bind,
+                    ledger,
+                    all,
+                    api_root,
+                    token_store,
+                },
+        } => {
+            let environment = UserEnvironment::discover()?;
+            let token_store_path = token_store_path(&environment, token_store);
+            let bearer_tokens =
+                Arc::new(fact_http::SqliteBearerTokenStore::open(&token_store_path)?);
+            let address = bind.parse::<std::net::SocketAddr>()?;
+            let api_root = api_root.unwrap_or_else(|| format!("http://{address}/facts"));
+            let served_ledgers = if all {
+                if ledger.is_some() {
+                    return Err(user_error(
+                        "fact http serve accepts either --ledger or --all, not both",
+                    ));
+                }
+                environment
+                    .load()?
+                    .into_values()
+                    .filter(|entry| !entry.read_only)
+                    .collect::<Vec<_>>()
+            } else {
+                vec![environment.resolve(ledger.as_deref())?]
+            };
+            if served_ledgers.is_empty() {
+                return Err(user_error("no writable ledgers to serve"));
+            }
+            let hosted_ledgers = served_ledgers
+                .iter()
+                .map(|entry| {
+                    let store = fact_store::Store::open(&entry.database)?;
+                    let seed = environment.read_seed(entry)?;
+                    let coordinator_key = fact_crypto::SigningKey::from_seed(&seed)?;
+                    let ledger_id = entry.ledger_id.parse::<fact_core::ObjectId>()?;
+                    let coordinator_actor_id = entry.actor_id.parse::<fact_core::ObjectId>()?;
+                    Ok(fact_http::HostedLedger {
+                        ledger_id,
+                        store,
+                        coordinator_key,
+                        coordinator_actor_id,
+                    })
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+            let state = fact_http::AppState::new_with_reference_policy_for_ledgers(
+                api_root.clone(),
+                hosted_ledgers,
+            )
+            .map_err(user_error)?
+            .with_bearer_token_store(bearer_tokens);
+            if !cli.json {
+                if all {
+                    eprintln!("serving {} ledgers at {api_root}", served_ledgers.len());
+                    for entry in &served_ledgers {
+                        eprintln!("serving ledger {}", entry.ledger_id);
+                    }
+                } else {
+                    eprintln!(
+                        "serving ledger {} at {api_root}",
+                        served_ledgers[0].ledger_id
+                    );
+                }
+                eprintln!("token store {}", token_store_path.display());
+            }
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(address).await?;
+                fact_http::serve_reference(listener, state).await
+            })?;
+        }
+        Command::Http {
+            command: HttpCommand::Token { command },
+        } => {
+            handle_http_token_command(cli.json, command)?;
+        }
         Command::Ledger {
             command:
                 LedgerCommand::Clone {
@@ -3912,7 +4210,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 },
         } => {
             let environment = UserEnvironment::discover()?;
-            let entry = clone_read_only_ledger(&environment, &name, &source, &ledger)?;
+            let source = CloneSource {
+                is_remote_url: environment::is_remote_url(&source),
+                name_source: source.clone(),
+                url: source.clone(),
+                remote_name: None,
+                bearer_token: None,
+            };
+            let entry = clone_read_only_ledger(&environment, &name, &source, &ledger, None)?;
             environment.set_active(&name)?;
             print_json_or(
                 cli.json,
@@ -3921,7 +4226,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "name":entry.name,
                     "ledger_id":entry.ledger_id,
                     "read_only":true,
-                    "remote":if source.starts_with("http://") || source.starts_with("https://") {serde_json::Value::String(source)} else {serde_json::Value::Null}
+                    "remote":if source.is_remote_url {serde_json::Value::String(source.url)} else {serde_json::Value::Null}
                 }),
                 format!("cloned read-only ledger {}", entry.name),
             );
@@ -4042,6 +4347,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         && max_object_bytes.is_none() =>
                 {
                     let environment = UserEnvironment::discover()?;
+                    if personal_ledger.is_none() && environment.active_name()?.is_none() {
+                        return Err(
+                            "no local ledger is active; use `fact clone --remote NAME --ledger LEDGER_ID` first"
+                                .into(),
+                        );
+                    }
                     let entry = ensure_active_entry(&environment, personal_ledger.as_deref())?;
                     let remote = configured_remote(&environment, remote.as_deref())?;
                     personal_pull(&entry, &remote, cli.json)?;
@@ -4066,19 +4377,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Command::Identity {
-            command: IdentityCommand::Export { output, ledger },
+            command: IdentityCommand::Export { file, ledger },
         } => {
             let environment = UserEnvironment::discover()?;
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
+            let file = match file {
+                Some(file) => file,
+                None => default_identity_export_file(&entry)?,
+            };
             let result = fact_sdk::workflow::export_identity(&entry)?;
-            fs::write(&output, &result.bundle)?;
+            fs::write(&file, &result.bundle)?;
             print_json_or(
                 cli.json,
-                serde_json::json!({"exported":result.exported,"objects":result.objects,"private_key_material":result.private_key_material,"file":output}),
+                serde_json::json!({"exported":result.exported,"objects":result.objects,"private_key_material":result.private_key_material,"file":file}),
                 format!(
                     "exported {} identity object(s) to {}",
                     result.objects,
-                    output.display()
+                    file.display()
                 ),
             );
         }
@@ -4318,6 +4633,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     file,
                     remote,
                     ledger,
+                    bearer_token,
                 },
         } => {
             let bytes = fs::read(file)?;
@@ -4332,11 +4648,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "ledger",
                 )?;
                 let endpoint = format!(
-                    "{}/facts/ledgers/{}/objects:push",
+                    "{}/facts/ledgers/{}/object-pushes",
                     remote.trim_end_matches('/'),
                     ledger
                 );
-                let response = reqwest::blocking::Client::new()
+                let request = reqwest::blocking::Client::new()
                     .post(endpoint)
                     .header("content-type", "application/fact-bundle")
                     .header("facts-protocol-version", "0")
@@ -4345,8 +4661,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "content-digest",
                         fact_sdk::sync::content_digest_header(&bytes),
                     )
-                    .body(bytes)
-                    .send()?;
+                    .body(bytes);
+                let response = with_bearer_token(request, bearer_token.as_deref()).send()?;
                 let status = response.status();
                 let body = response.bytes()?.to_vec();
                 if !status.is_success() {
@@ -4388,23 +4704,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     limit,
                     max_object_bytes,
                     remote,
+                    bearer_token,
                 },
         } => {
             let ledger = parse_uuid7(&ledger, "ledger")?;
-            let known = known_hashes
-                .map(|path| read_hashes(&path))
-                .transpose()?
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<std::collections::HashSet<_>>();
+            let explicit_known = known_hashes.map(|path| read_hashes(&path)).transpose()?;
             if let Some(remote) = remote {
+                let known = match explicit_known {
+                    Some(hashes) => hashes.into_iter().collect::<std::collections::HashSet<_>>(),
+                    None if database.exists() => {
+                        let store = fact_store::Store::open(&database)?;
+                        let mut known = store
+                            .list_object_hashes(ledger.as_bytes())?
+                            .into_iter()
+                            .collect::<std::collections::HashSet<_>>();
+                        known.extend(
+                            store
+                                .list_identity_objects()?
+                                .into_iter()
+                                .map(|(_, hash, _)| hash),
+                        );
+                        known
+                    }
+                    None => std::collections::HashSet::new(),
+                };
                 if limit.is_some() || max_object_bytes.is_some() {
                     return Err(
                         "--limit and --max-object-bytes are only supported for local pull".into(),
                     );
                 }
                 let endpoint = format!(
-                    "{}/facts/ledgers/{}/objects:pull",
+                    "{}/facts/ledgers/{}/object-pulls",
                     remote.trim_end_matches('/'),
                     ledger
                 );
@@ -4413,7 +4743,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let status = loop {
                     let body =
                         fact_sdk::sync::encode_pull_request(ledger, &known, cursor.as_deref())?;
-                    let response = reqwest::blocking::Client::new()
+                    let request = reqwest::blocking::Client::new()
                         .post(&endpoint)
                         .header("content-type", "application/fact+json")
                         .header("facts-protocol-version", "0")
@@ -4422,8 +4752,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             "content-digest",
                             fact_sdk::sync::content_digest_header(&body),
                         )
-                        .body(body)
-                        .send()?;
+                        .body(body);
+                    let response = with_bearer_token(request, bearer_token.as_deref()).send()?;
                     let status = response.status();
                     let response_body = response.bytes()?.to_vec();
                     if !status.is_success() {
@@ -4454,6 +4784,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ledger,
                     &mut objects,
                     &known,
+                    bearer_token.as_deref(),
                 )?;
                 let bundle = fact_sdk::sync::encode_bundle(ledger, &objects)?;
                 fs::write(output, &bundle)?;
@@ -4467,6 +4798,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 return Ok(());
             }
+            let known = explicit_known
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
             let store = fact_store::Store::open(database)?;
             let mut output_file = fs::File::create(output)?;
             let result = fact_sdk::sync::write_pull_bundle_from_store_with_options(
@@ -5070,6 +5405,190 @@ fn print_json_or(json: bool, value: serde_json::Value, human: String) {
     }
 }
 
+fn token_store_path(environment: &UserEnvironment, override_path: Option<PathBuf>) -> PathBuf {
+    override_path.unwrap_or_else(|| {
+        environment
+            .remote_file
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("access")
+            .join("tokens.sqlite")
+    })
+}
+
+fn handle_http_token_command(
+    json: bool,
+    command: HttpTokenCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let environment = UserEnvironment::discover()?;
+    match command {
+        HttpTokenCommand::Issue {
+            actor,
+            ledger,
+            expires_days,
+            label,
+            token_store,
+        } => {
+            let entry = environment.resolve(ledger.as_deref())?;
+            let actor_id = match actor {
+                Some(actor) => {
+                    fact_sdk::workflow::resolve_directory_actor_reference(&entry, &actor)?
+                }
+                None => uuid::Uuid::parse_str(&entry.actor_id)?,
+            };
+            let issued = issue_http_actor_token(
+                &environment,
+                &entry,
+                actor_id,
+                expires_days,
+                label,
+                token_store,
+            )?;
+            print_json_or(
+                json,
+                access_token_json(&issued),
+                format!(
+                    "issued token {}\n{}",
+                    issued.issued.record.token_id, issued.issued.token
+                ),
+            );
+        }
+        HttpTokenCommand::List { token_store } => {
+            let path = token_store_path(&environment, token_store);
+            let store = fact_http::SqliteBearerTokenStore::open(&path)?;
+            let records = store.list_tokens()?;
+            let value = serde_json::json!({
+                "token_store":path,
+                "tokens":records.iter().map(token_record_json).collect::<Vec<_>>()
+            });
+            if json {
+                println!("{value}");
+            } else if records.is_empty() {
+                println!("no tokens");
+            } else {
+                for record in records {
+                    println!(
+                        "{}  actor {}  ledger {}{}{}",
+                        record.token_id,
+                        record.actor_id,
+                        record
+                            .ledger_id
+                            .map(|ledger| ledger.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        record
+                            .expires_at
+                            .map(|value| format!("  expires {}", format_http_time(value)))
+                            .unwrap_or_default(),
+                        if record.revoked_at.is_some() {
+                            "  revoked"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+        }
+        HttpTokenCommand::Revoke {
+            token_id,
+            token_store,
+        } => {
+            let path = token_store_path(&environment, token_store);
+            let store = fact_http::SqliteBearerTokenStore::open(&path)?;
+            let revoked = store.revoke_token_id(&token_id, time::OffsetDateTime::now_utc())?;
+            print_json_or(
+                json,
+                serde_json::json!({"revoked":revoked,"token_id":token_id,"token_store":path}),
+                if revoked {
+                    format!("revoked token {token_id}")
+                } else {
+                    format!("token not found or already revoked: {token_id}")
+                },
+            );
+        }
+        HttpTokenCommand::Prune { token_store } => {
+            let path = token_store_path(&environment, token_store);
+            let store = fact_http::SqliteBearerTokenStore::open(&path)?;
+            let pruned = store.prune_expired_or_revoked(time::OffsetDateTime::now_utc())?;
+            print_json_or(
+                json,
+                serde_json::json!({"pruned":pruned,"token_store":path}),
+                format!("pruned {pruned} token(s)"),
+            );
+        }
+    }
+    Ok(())
+}
+
+struct IssuedHttpActorToken {
+    issued: fact_http::IssuedBearerToken,
+    token_store: PathBuf,
+}
+
+fn issue_http_actor_token(
+    environment: &UserEnvironment,
+    entry: &LedgerEntry,
+    actor_id: uuid::Uuid,
+    expires_days: Option<i64>,
+    label: Option<String>,
+    token_store: Option<PathBuf>,
+) -> Result<IssuedHttpActorToken, Box<dyn std::error::Error>> {
+    let ledger_id = entry.ledger_id.parse::<fact_core::ObjectId>()?;
+    let actor_id = actor_id.to_string().parse::<fact_core::ObjectId>()?;
+    let expires_at = http_token_expires_at(expires_days)?;
+    let path = token_store_path(environment, token_store);
+    let store = fact_http::SqliteBearerTokenStore::open(&path)?;
+    let issued = store.issue_token(actor_id, Some(ledger_id), expires_at, label)?;
+    Ok(IssuedHttpActorToken {
+        issued,
+        token_store: path,
+    })
+}
+
+fn http_token_expires_at(
+    expires_days: Option<i64>,
+) -> Result<Option<time::OffsetDateTime>, Box<dyn std::error::Error>> {
+    expires_days
+        .map(|days| {
+            if days <= 0 {
+                return Err(user_error("--expires-days must be greater than zero"));
+            }
+            Ok(time::OffsetDateTime::now_utc() + time::Duration::days(days))
+        })
+        .transpose()
+}
+
+fn access_token_json(token: &IssuedHttpActorToken) -> serde_json::Value {
+    let issued = &token.issued;
+    serde_json::json!({
+        "token":issued.token,
+        "token_id":issued.record.token_id,
+        "actor_id":issued.record.actor_id.to_string(),
+        "ledger_id":issued.record.ledger_id.map(|ledger| ledger.to_string()),
+        "expires_at":issued.record.expires_at.map(format_http_time),
+        "label":issued.record.label.clone(),
+        "token_store":token.token_store.clone()
+    })
+}
+
+fn token_record_json(record: &fact_http::BearerTokenRecord) -> serde_json::Value {
+    serde_json::json!({
+        "token_id":record.token_id,
+        "actor_id":record.actor_id.to_string(),
+        "ledger_id":record.ledger_id.map(|ledger| ledger.to_string()),
+        "created_at":format_http_time(record.created_at),
+        "expires_at":record.expires_at.map(format_http_time),
+        "revoked_at":record.revoked_at.map(format_http_time),
+        "last_used_at":record.last_used_at.map(format_http_time),
+        "label":record.label
+    })
+}
+
+fn format_http_time(value: time::OffsetDateTime) -> String {
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("OffsetDateTime can be formatted as RFC3339")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PagerPolicy {
     Auto,
@@ -5595,19 +6114,73 @@ where
     }
 }
 
+#[derive(Clone, Debug)]
+struct ConfiguredRemote {
+    url: String,
+    bearer_token: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CloneSource {
+    url: String,
+    name_source: String,
+    remote_name: Option<String>,
+    bearer_token: Option<String>,
+    is_remote_url: bool,
+}
+
+fn clone_source_from_args(
+    environment: &UserEnvironment,
+    source: Option<String>,
+    remote: Option<String>,
+) -> Result<CloneSource, Box<dyn std::error::Error>> {
+    match (source, remote) {
+        (Some(source), None) => Ok(CloneSource {
+            is_remote_url: environment::is_remote_url(&source),
+            name_source: source.clone(),
+            url: source,
+            remote_name: None,
+            bearer_token: None,
+        }),
+        (None, Some(remote_name)) => {
+            let remote = configured_remote(environment, Some(&remote_name))?;
+            Ok(CloneSource {
+                url: remote.url,
+                name_source: remote_name.clone(),
+                remote_name: Some(remote_name),
+                bearer_token: remote.bearer_token,
+                is_remote_url: true,
+            })
+        }
+        (None, None) => Err("fact clone requires SOURCE or --remote NAME".into()),
+        (Some(_), Some(_)) => {
+            Err("fact clone accepts either SOURCE or --remote NAME, not both".into())
+        }
+    }
+}
+
 fn configured_remote(
     environment: &UserEnvironment,
     requested: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<ConfiguredRemote, Box<dyn std::error::Error>> {
     let remotes = environment.load_remotes()?;
     if let Some(requested) = requested {
         return Ok(remotes
             .get(requested)
-            .map(|remote| remote.url.clone())
-            .unwrap_or_else(|| requested.to_owned()));
+            .map(|remote| ConfiguredRemote {
+                url: remote.url.clone(),
+                bearer_token: remote.bearer_token.clone(),
+            })
+            .unwrap_or_else(|| ConfiguredRemote {
+                url: requested.to_owned(),
+                bearer_token: None,
+            }));
     }
     match remotes.values().collect::<Vec<_>>().as_slice() {
-        [remote] => Ok(remote.url.clone()),
+        [remote] => Ok(ConfiguredRemote {
+            url: remote.url.clone(),
+            bearer_token: remote.bearer_token.clone(),
+        }),
         [] => Err("no remote is configured; add one with fact ledger remote add NAME URL".into()),
         _ => Err("multiple remotes are configured; pass --remote NAME or URL".into()),
     }
@@ -5615,7 +6188,7 @@ fn configured_remote(
 
 fn personal_push(
     entry: &LedgerEntry,
-    remote: &str,
+    remote: &ConfiguredRemote,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if entry.read_only {
@@ -5636,16 +6209,21 @@ fn personal_push(
         bundle_path.as_str(),
     ];
     forward_cli_command(false, pull_args)?;
-    let push_args = [
-        "sync",
-        "push",
-        database.as_str(),
-        bundle_path.as_str(),
-        "--remote",
-        remote,
-        "--ledger",
-        ledger.as_str(),
+    let mut push_args = vec![
+        "sync".to_owned(),
+        "push".to_owned(),
+        database,
+        bundle_path,
+        "--remote".to_owned(),
+        remote.url.clone(),
+        "--ledger".to_owned(),
+        ledger,
     ];
+    if let Some(token) = &remote.bearer_token {
+        push_args.push("--bearer-token".to_owned());
+        push_args.push(token.clone());
+    }
+    let push_args = push_args.iter().map(String::as_str).collect::<Vec<_>>();
     let result = forward_cli_command(json, push_args);
     let _ = fs::remove_file(&bundle);
     result
@@ -5653,7 +6231,7 @@ fn personal_push(
 
 fn personal_pull(
     entry: &LedgerEntry,
-    remote: &str,
+    remote: &ConfiguredRemote,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if entry.read_only {
@@ -5666,15 +6244,20 @@ fn personal_pull(
     let database = entry.database.to_string_lossy().into_owned();
     let ledger = entry.ledger_id.clone();
     let bundle_path = bundle.to_string_lossy().into_owned();
-    let pull_args = [
-        "sync",
-        "pull",
-        database.as_str(),
-        ledger.as_str(),
-        bundle_path.as_str(),
-        "--remote",
-        remote,
+    let mut pull_args = vec![
+        "sync".to_owned(),
+        "pull".to_owned(),
+        database.clone(),
+        ledger,
+        bundle_path.clone(),
+        "--remote".to_owned(),
+        remote.url.clone(),
     ];
+    if let Some(token) = &remote.bearer_token {
+        pull_args.push("--bearer-token".to_owned());
+        pull_args.push(token.clone());
+    }
+    let pull_args = pull_args.iter().map(String::as_str).collect::<Vec<_>>();
     forward_cli_command(false, pull_args)?;
     let import_args = ["object", "import", database.as_str(), bundle_path.as_str()];
     let result = forward_cli_command(json, import_args);
@@ -5712,6 +6295,23 @@ fn ensure_active_entry(
     requested: Option<&str>,
 ) -> Result<LedgerEntry, Box<dyn std::error::Error>> {
     Ok(environment.resolve(requested)?)
+}
+
+fn default_identity_export_file(
+    entry: &LedgerEntry,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let ledger_segment = if entry.name.is_empty() {
+        let ledger_id = uuid::Uuid::parse_str(&entry.ledger_id)?;
+        fact_sdk::reference::short_uuid_reference(ledger_id)
+    } else {
+        entry.name.clone()
+    };
+    let actor_id = uuid::Uuid::parse_str(&entry.actor_id)?;
+    let actor_segment = fact_sdk::reference::short_uuid_reference(actor_id);
+
+    Ok(PathBuf::from(format!(
+        "{ledger_segment}.identity.{actor_segment}.bundle"
+    )))
 }
 
 mod fact_as {
@@ -6296,27 +6896,38 @@ fn as_user_identity(
 fn clone_read_only_ledger(
     environment: &UserEnvironment,
     name: &str,
-    source: &str,
+    source: &CloneSource,
     ledger: &str,
+    actor: Option<CloneActorBinding>,
 ) -> Result<LedgerEntry, Box<dyn std::error::Error>> {
     let bundle_path =
         std::env::temp_dir().join(format!("fact-clone-{}.bundle", uuid::Uuid::now_v7()));
-    if environment::is_remote_url(source) {
+    if source.is_remote_url {
         let database =
             std::env::temp_dir().join(format!("fact-clone-{}.sqlite", uuid::Uuid::now_v7()));
-        let args = [
-            "sync",
-            "pull",
-            database.to_str().ok_or("invalid temporary database path")?,
-            ledger,
+        let mut args = vec![
+            "sync".to_owned(),
+            "pull".to_owned(),
+            database
+                .to_str()
+                .ok_or("invalid temporary database path")?
+                .to_owned(),
+            ledger.to_owned(),
             bundle_path
                 .to_str()
-                .ok_or("invalid temporary bundle path")?,
-            "--remote",
-            source,
+                .ok_or("invalid temporary bundle path")?
+                .to_owned(),
+            "--remote".to_owned(),
+            source.url.clone(),
         ];
+        if let Some(token) = &source.bearer_token {
+            args.push("--bearer-token".to_owned());
+            args.push(token.clone());
+        }
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
         let status = ProcessCommand::new(std::env::current_exe()?)
             .args(args)
+            .stdout(Stdio::null())
             .status()?;
         let _ = fs::remove_file(database);
         if !status.success() {
@@ -6324,18 +6935,147 @@ fn clone_read_only_ledger(
             return Err("remote clone pull failed".into());
         }
     } else {
-        fs::copy(source, &bundle_path)?;
+        fs::copy(&source.url, &bundle_path)?;
     }
     let bytes = fs::read(&bundle_path)?;
     let _ = fs::remove_file(&bundle_path);
     let objects = environment::decode_clone_source_objects(&bytes)?;
-    Ok(environment::clone_read_only_ledger_from_objects(
+    let entry = environment::clone_read_only_ledger_from_objects(
         environment,
         name,
         ledger,
         &objects,
-        environment::is_remote_url(source).then_some(source),
+        source.is_remote_url.then_some(source.url.as_str()),
+    )?;
+    if source.is_remote_url {
+        if let Some(token) = &source.bearer_token {
+            environment::set_remote_bearer_token(environment, name, Some(token.clone()))?;
+        }
+    }
+    if let Some(actor) = actor {
+        match bind_cloned_ledger_actor(environment, name, &entry, actor) {
+            Ok(entry) => return Ok(entry),
+            Err(error) => {
+                let _ = environment::delete_ledger(environment, name, true);
+                return Err(error);
+            }
+        }
+    }
+    Ok(entry)
+}
+
+struct CloneActorBinding {
+    input: String,
+    actor_id: Option<uuid::Uuid>,
+}
+
+fn clone_actor_binding(
+    environment: &UserEnvironment,
+    actor: &str,
+) -> Result<CloneActorBinding, Box<dyn std::error::Error>> {
+    let actor_id = if let Ok(actor_id) = uuid::Uuid::parse_str(actor) {
+        Some(actor_id)
+    } else {
+        match environment.resolve(None) {
+            Ok(entry) => match fact_sdk::workflow::resolve_directory_actor_reference(&entry, actor)
+            {
+                Ok(actor_id) => Some(actor_id),
+                Err(fact_sdk::Error::MissingObject(_)) => None,
+                Err(error) => return Err(error.into()),
+            },
+            Err(_) => None,
+        }
+    };
+    Ok(CloneActorBinding {
+        input: actor.to_owned(),
+        actor_id,
+    })
+}
+
+fn resolve_cloned_ledger_actor(
+    entry: &LedgerEntry,
+    actor: &str,
+) -> Result<uuid::Uuid, Box<dyn std::error::Error>> {
+    if let Ok(actor_id) = uuid::Uuid::parse_str(actor) {
+        return Ok(actor_id);
+    }
+    Ok(fact_sdk::workflow::resolve_directory_actor_reference(
+        entry, actor,
     )?)
+}
+
+fn bind_cloned_ledger_actor(
+    environment: &UserEnvironment,
+    name: &str,
+    entry: &LedgerEntry,
+    actor: CloneActorBinding,
+) -> Result<LedgerEntry, Box<dyn std::error::Error>> {
+    let store = fact_store::Store::open(&entry.database)?;
+    let actor_id = match actor.actor_id {
+        Some(actor_id) => actor_id,
+        None => resolve_cloned_ledger_actor(entry, &actor.input)?,
+    };
+    let (_binding_id, key_id) = store
+        .get_actor_key_binding_for_actor(actor_id.as_bytes())?
+        .ok_or_else(|| {
+            user_error(format!(
+                "actor {actor_id} has no signing key binding in cloned ledger; clone without --as for read-only"
+            ))
+        })?;
+    let seed_file = local_identity_seed_file(environment, actor_id, key_id)?;
+    let capabilities = actor_capabilities_in_store(&store, entry, actor_id)?;
+    if capabilities.is_empty() {
+        return Err(user_error(format!(
+            "actor {actor_id} has no write authority in cloned ledger; clone without --as for read-only"
+        )));
+    }
+    let mut entries = environment.load()?;
+    let updated = LedgerEntry {
+        actor_id: actor_id.to_string(),
+        key_id: key_id.to_string(),
+        seed_file,
+        read_only: false,
+        ..entry.clone()
+    };
+    entries.insert(name.to_owned(), updated.clone());
+    environment.save(&entries)?;
+    Ok(updated)
+}
+
+fn local_identity_seed_file(
+    environment: &UserEnvironment,
+    actor_id: uuid::Uuid,
+    key_id: uuid::Uuid,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    for candidate in [
+        environment.identity_dir.join(format!("{actor_id}.seed")),
+        environment.identity_dir.join(format!("{key_id}.seed")),
+    ] {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(user_error(format!(
+        "local private key material is not available for {actor_id}"
+    )))
+}
+
+fn actor_capabilities_in_store(
+    store: &fact_store::Store,
+    entry: &LedgerEntry,
+    actor_id: uuid::Uuid,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let ledger = uuid::Uuid::parse_str(&entry.ledger_id)?;
+    let mut capabilities = Vec::new();
+    for capability in GRANTABLE_CAPABILITIES {
+        if !store
+            .list_authority_grant_payloads(ledger.as_bytes(), actor_id.as_bytes(), capability.name)?
+            .is_empty()
+        {
+            capabilities.push(capability.name.to_owned());
+        }
+    }
+    Ok(capabilities)
 }
 
 fn recognize_user_identity(
@@ -8077,13 +8817,24 @@ fn read_hashes(path: &PathBuf) -> Result<Vec<fact_core::Hash>, Box<dyn std::erro
         .collect::<Result<Vec<fact_core::Hash>, _>>()?)
 }
 
+fn with_bearer_token(
+    request: reqwest::blocking::RequestBuilder,
+    bearer_token: Option<&str>,
+) -> reqwest::blocking::RequestBuilder {
+    match bearer_token {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
+}
+
 fn fetch_remote_dependencies(
     remote: &str,
     ledger: uuid::Uuid,
     objects: &mut Vec<(fact_core::Hash, Vec<u8>)>,
     known: &std::collections::HashSet<fact_core::Hash>,
+    bearer_token: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let endpoint = format!("{remote}/facts/ledgers/{ledger}/objects:fetch");
+    let endpoint = format!("{remote}/facts/ledgers/{ledger}/object-fetches");
     let client = reqwest::blocking::Client::new();
     let mut present = objects
         .iter()
@@ -8102,7 +8853,7 @@ fn fetch_remote_dependencies(
             continue;
         }
         let body = fact_sdk::sync::encode_fetch_request(&requested)?;
-        let response = client
+        let request = client
             .post(&endpoint)
             .header("content-type", "application/fact+json")
             .header("facts-protocol-version", "0")
@@ -8111,8 +8862,8 @@ fn fetch_remote_dependencies(
                 "content-digest",
                 fact_sdk::sync::content_digest_header(&body),
             )
-            .body(body)
-            .send()?;
+            .body(body);
+        let response = with_bearer_token(request, bearer_token).send()?;
         let status = response.status();
         let response_body = response.bytes()?.to_vec();
         if !status.is_success() {

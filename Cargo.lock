@@ -428,13 +428,14 @@ dependencies = [
 
 [[package]]
 name = "fact"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "clap",
  "fact-canonical",
  "fact-commitment",
  "fact-core",
  "fact-crypto",
+ "fact-http",
  "fact-schema",
  "fact-sdk",
  "fact-search",
@@ -447,13 +448,14 @@ dependencies = [
  "serde_json",
  "tempfile",
  "time",
+ "tokio",
  "toml",
  "uuid",
 ]
 
 [[package]]
 name = "fact-canonical"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fact-core",
  "serde_json",
@@ -463,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "fact-commitment"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fact-canonical",
  "fact-core",
@@ -477,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "fact-conformance"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "fact-canonical",
@@ -499,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "fact-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "serde",
@@ -511,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "fact-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "fact-canonical",
@@ -522,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "fact-http"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bytes",
@@ -537,6 +539,9 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rand 0.8.7",
+ "reqwest",
+ "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",
@@ -549,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "fact-schema"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fact-canonical",
  "fact-core",
@@ -560,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "fact-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fact-canonical",
  "fact-commitment",
@@ -585,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "fact-search"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fact-canonical",
  "fact-core",
@@ -598,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "fact-state"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fact-core",
  "thiserror",
@@ -606,7 +611,7 @@ dependencies = [
 
 [[package]]
 name = "fact-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fact-canonical",
  "fact-core",
@@ -764,9 +769,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.15"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1247,9 +1252,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.16"
+version = "0.11.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
+checksum = "04759210543be93709136e28212294a659ef5001836ff4eab4d663e4529bba83"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -2328,9 +2333,9 @@ dependencies = [
 
 [[package]]
 name = "zerovec-derive"
-version = "0.11.4"
+version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47402523226a02bfe5230160dc3ccc089aa6f6f19e7fcbb4e6f824bbb1b4aa62"
+checksum = "9f212a141d820099d57ffafb9569be9617a6f27d3dc881fbee8fb56642f917a9"
 dependencies = [
  "proc-macro2",
  "quote",
