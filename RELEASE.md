@@ -1,5 +1,30 @@
 # Release
 
-## Version: 0.2.0
+## Version: 0.4.1
 
-- [notice] # Release 0.2.0 ([details](.changes/1787420411@0.2.0/notice/1787420032-72147.md))
+- [defect] Allow scoped capability inspection. ([details](.changes/1788641784@0.4.1/defect/capabilities-ledger-option.md))
+- [defect] Prefer ledger directory actors during writable clone. ([details](.changes/1788641784@0.4.1/defect/clone-as-directory-first.md))
+- [defect] Name missing clone dependency identities. ([details](.changes/1788641784@0.4.1/defect/clone-dependency-diagnostics.md))
+- [defect] Correct clone help text so the command no longer claims every clone is ([details](.changes/1788641784@0.4.1/defect/clone-help-writable.md))
+- [defect] Avoid creating duplicate remote entries during clone, reuse configured remotes ([details](.changes/1788641784@0.4.1/defect/clone-remote-duplicates.md))
+- [defect] Keep ledger admins recoverable after fact as. ([details](.changes/1788641784@0.4.1/defect/fact-as-admin-recovery.md))
+- [defect] Preflight fact as permission grants. ([details](.changes/1788641784@0.4.1/defect/fact-as-permission-preflight.md))
+- [defect] Remote Add Advertised Ledger ([details](.changes/1788641784@0.4.1/defect/remote-add-advertised-ledger.md))
+- [defect] Detect remote ledger mismatches before object pull or push requests and point ([details](.changes/1788641784@0.4.1/defect/remote-ledger-mismatch.md))
+- [defect] Report missing local private key material in status. ([details](.changes/1788641784@0.4.1/defect/status-missing-key-material.md))
+- [feature] Add actor admission bootstrap ([details](.changes/1788641784@0.4.1/feature/actor-admission-bootstrap.md))
+- [feature] Show capabilities for listed actors. ([details](.changes/1788641784@0.4.1/feature/actor-capability-inspection.md))
+- [feature] Define actor exchange artifacts. ([details](.changes/1788641784@0.4.1/feature/actor-exchange-artifacts.md))
+- [feature] Hide comment and http from casual help. ([details](.changes/1788641784@0.4.1/feature/casual-help-command-focus.md))
+- [feature] Add global actor profiles. ([details](.changes/1788641784@0.4.1/feature/global-actor-profiles.md))
+- [feature] Carry directory names with identity exports. ([details](.changes/1788641784@0.4.1/feature/identity-directory-metadata.md))
+- [feature] Scope identity exports to one actor. ([details](.changes/1788641784@0.4.1/feature/identity-export-actor.md))
+- [feature] Remote Descriptors ([details](.changes/1788641784@0.4.1/feature/remote-descriptor.md))
+- [feature] Record target ledger IDs in remote configuration, let remote add discover a ([details](.changes/1788641784@0.4.1/feature/remote-target-ledger.md))
+- [feature] Add reusable signing personas. ([details](.changes/1788641784@0.4.1/feature/reusable-signing-personas.md))
+- [feature] Use storeless persona identity creation. ([details](.changes/1788641784@0.4.1/feature/storeless-persona-cli.md))
+- [update] Add actor porcelain commands. ([details](.changes/1788641784@0.4.1/update/actor-porcelain-commands.md))
+- [update] Control bearer token output. ([details](.changes/1788641784@0.4.1/update/bearer-token-output.md))
+- [update] Report actors from identity imports. ([details](.changes/1788641784@0.4.1/update/identity-import-actors.md))
+- [update] Accept ledger names, remote names, UUIDs, and short references wherever CLI ([details](.changes/1788641784@0.4.1/update/ledger-reference-resolution.md))
+- [update] Standardize remote auth stream input. ([details](.changes/1788641784@0.4.1/update/stream-flags.md))

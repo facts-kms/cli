@@ -117,6 +117,32 @@ fact use default
 fact clone ./ledger.bundle
 ```
 
+Mirror a remote ledger with `fact clone`. A newly initialized empty local
+ledger has its own ledger ID, so it cannot be turned into a mirror of a remote
+ledger with `fact pull` or `fact push`; remote sync only exchanges objects when
+the local and remote ledger IDs match.
+
+Remote descriptors are readable JSON documents that describe a remote ledger endpoint.
+They carry `url`, `ledger_id`, `genesis_hash`, and optionally `token`. Use
+`fact remote from FILE [NAME]` to configure or rotate a remote without copying
+ledger data. Use `fact clone --from FILE` to configure the remote through the
+same descriptor path before cloning it. Descriptor consumers verify
+`genesis_hash` against the remote ledger discovery response before saving remote
+configuration. If a descriptor contains `token`, the command reports that the
+descriptor file still contains a live credential after use.
+
+Use `fact clone --as <actor>` for a writable clone. The actor must resolve in
+your local identity directory, its private key material must be present locally,
+the remote ledger must recognize that actor's signing key, and the actor must
+have write authority in that ledger. The corresponding failures are reported as
+an unknown actor reference, missing local private key material, no signing key
+binding in the cloned ledger, or no write authority in the cloned ledger.
+
+Use `fact identity export --actor <actor> FILE` to write a public identity
+bundle for one local actor. The bundle is safe to transmit because it contains
+only public identity objects; private signing seeds stay under
+`.facts/identities`.
+
 Work with propositions:
 
 ```sh
@@ -150,6 +176,14 @@ fact search "local ledger"
 fact find "accepted storage decision"
 fact history 01a00
 ```
+
+## Command Conventions
+
+Commands that need a flag for their principal input or output stream use
+`--input` / `-i` and `--output` / `-o`. A value of `-` means stdin for
+`--input` and stdout for `--output`. Positional file arguments stay positional,
+and auxiliary files keep descriptive names such as `--known-hashes` or
+`--token-store`.
 
 ## Repository Scope
 

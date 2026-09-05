@@ -8,10 +8,18 @@ use std::{
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitCode, Stdio},
+    str::FromStr,
     sync::Arc,
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+pub mod actor_exchange;
+
 struct UserMessage(String);
+
+const IDENTITY_EXPORT_SCHEMA: &str = "fact-identity-bundle-v0";
 
 impl fmt::Debug for UserMessage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -468,7 +476,15 @@ enum Command {
         about = "List grantable permission capabilities",
         display_order = 16
     )]
-    Capabilities,
+    Capabilities {
+        #[arg(help = "Actor ID, short ref, directory alias, or display name to inspect")]
+        actor: Option<String>,
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
+        ledger: Option<String>,
+    },
     #[command(
         about = "Create or switch the active user for the current ledger",
         display_order = 15
@@ -489,6 +505,8 @@ enum Command {
         self_actor: bool,
         #[arg(long = "type", help = "Actor type: human, agent, or service")]
         actor_type: Option<String>,
+        #[arg(long, help = "Apply a FACT_HOME actor profile")]
+        profile: Option<String>,
         #[arg(long, help = "Role or responsibility label")]
         role: Option<String>,
         #[arg(long, help = "Source for this directory entry")]
@@ -533,13 +551,18 @@ enum Command {
             help = "Update the directory entry when supplied metadata differs"
         )]
         update_directory: bool,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Start a new local ledger for your facts", display_order = 60)]
     Init {
         #[arg(help = "A friendly name for the new ledger (default: default)")]
         name: Option<String>,
+        #[arg(long, help = "Use a reusable local persona as the ledger admin")]
+        persona: Option<String>,
     },
     #[command(
         hide = true,
@@ -562,6 +585,12 @@ enum Command {
         #[arg(
             long,
             requires = "init",
+            help = "Use a reusable local persona as the ledger admin"
+        )]
+        persona: Option<String>,
+        #[arg(
+            long,
+            requires = "init",
             help = "Create the ledger without activating it"
         )]
         no_switch: bool,
@@ -581,16 +610,12 @@ enum Command {
     New {
         #[arg(help = "A friendly name for the new ledger (default: default)")]
         name: Option<String>,
+        #[arg(long, help = "Use a reusable local persona as the ledger admin")]
+        persona: Option<String>,
     },
-    #[command(
-        about = "Copy a shared ledger into a read-only local ledger",
-        display_order = 18
-    )]
+    #[command(about = "Copy a shared ledger into a local mirror", display_order = 18)]
     Clone {
-        #[arg(
-            help = "A local bundle path or remote URL to copy",
-            required_unless_present = "remote"
-        )]
+        #[arg(help = "A local bundle path or remote URL to copy")]
         source: Option<String>,
         #[arg(
             long,
@@ -598,13 +623,19 @@ enum Command {
             help = "The configured remote to copy"
         )]
         remote: Option<String>,
-        #[arg(long, help = "The ledger ID to copy when the source is remote")]
+        #[arg(
+            long = "from",
+            conflicts_with_all = ["source", "remote"],
+            help = "A remote descriptor to configure and clone from"
+        )]
+        descriptor: Option<PathBuf>,
+        #[arg(long, help = "The ledger to copy when the source is remote")]
         ledger: Option<String>,
         #[arg(long, help = "A friendly local name for the cloned ledger")]
         name: Option<String>,
         #[arg(
             long = "as",
-            help = "Bind the cloned ledger to an existing local identity"
+            help = "Create a writable clone as a local identity already recognized and granted in the remote ledger"
         )]
         actor: Option<String>,
     },
@@ -620,7 +651,7 @@ enum Command {
         name: Option<String>,
         #[arg(
             long,
-            help = "The ledger ID to use when the database contains more than one ledger"
+            help = "The ledger to use when the database contains more than one ledger"
         )]
         ledger: Option<String>,
     },
@@ -650,7 +681,10 @@ enum Command {
             help = "Use this short Markdown text instead of a file or editor"
         )]
         message: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -660,24 +694,34 @@ enum Command {
     Deliberate {
         #[arg(help = "A proposition ID or other reference understood by Fact")]
         reference: String,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(hide = true, about = "List review steps associated with a proposition")]
     Deliberations {
         #[arg(help = "A proposition reference to review")]
         reference: String,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(hide = true, about = "Show review details for a proposition")]
     ShowDeliberation {
         #[arg(help = "A review reference")]
         reference: String,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
+        hide = true,
         about = "Add a comment to a proposition or its discussion",
         display_order = 20
     )]
@@ -691,7 +735,10 @@ enum Command {
             help = "Use this short Markdown text instead of a file or editor"
         )]
         message: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -735,7 +782,10 @@ enum Command {
         limit: usize,
         #[arg(long, help = "Print full comment content instead of summaries")]
         content: bool,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -791,7 +841,10 @@ enum Command {
             help = "General cap for repeated subsections; use 0 for no limit"
         )]
         limit: usize,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -807,7 +860,10 @@ enum Command {
             help = "Include resolved, non-current, or historical conflict groups when available"
         )]
         all: bool,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Mark a proposition as accepted", display_order = 10)]
@@ -816,7 +872,10 @@ enum Command {
             help = "A proposition reference; omit when Fact can identify one pending proposition"
         )]
         reference: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Mark a proposition as rejected", display_order = 130)]
@@ -825,7 +884,10 @@ enum Command {
             help = "A proposition reference; omit when Fact can identify one pending proposition"
         )]
         reference: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -838,7 +900,10 @@ enum Command {
         reference: String,
         #[arg(help = "The person or actor to invite")]
         actor: String,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -849,7 +914,10 @@ enum Command {
     Invitations {
         #[command(subcommand)]
         command: Option<InvitationsCommand>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -865,7 +933,10 @@ enum Command {
             help = "The invitation ID or token when joining a proposition or discussion"
         )]
         invitation: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -876,7 +947,10 @@ enum Command {
     Leave {
         #[arg(help = "The proposition or discussion to leave")]
         reference: String,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -889,7 +963,10 @@ enum Command {
         reference: String,
         #[arg(long, help = "A short explanation for the withdrawal")]
         reason: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -902,7 +979,10 @@ enum Command {
         reference: String,
         #[arg(long, help = "A short explanation for the archival")]
         reason: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -920,7 +1000,10 @@ enum Command {
         pending: bool,
         #[arg(long, conflicts_with = "pending", help = "Open the latest revision")]
         latest: bool,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -938,7 +1021,10 @@ enum Command {
         pending: bool,
         #[arg(long, conflicts_with = "pending", help = "Print the latest revision")]
         latest: bool,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -961,7 +1047,10 @@ enum Command {
         pending: bool,
         #[arg(long, conflicts_with = "pending", help = "Export the latest revision")]
         latest: bool,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -983,7 +1072,10 @@ enum Command {
             help = "Use this short Markdown text instead of a file or editor"
         )]
         message: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(alias = "edit")]
@@ -998,12 +1090,18 @@ enum Command {
             help = "Use this short Markdown text instead of a file or editor"
         )]
         message: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Show which local ledger is active", display_order = 180)]
     Status {
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -1013,7 +1111,10 @@ enum Command {
     List {
         #[arg(long, value_enum, help = "Only show propositions with this status")]
         status: Option<ListStatus>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
         #[arg(
             long,
@@ -1039,7 +1140,10 @@ enum Command {
     Revisions {
         #[arg(help = "The proposition whose revisions you want to see")]
         reference: String,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -1047,7 +1151,10 @@ enum Command {
         display_order = 90
     )]
     Pending {
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -1112,7 +1219,10 @@ enum Command {
         offset: usize,
         #[arg(long, help = "Start after this proposition reference")]
         after: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -1151,7 +1261,10 @@ enum Command {
         pick: Vec<String>,
         #[arg(long, help = "Merge tool command to run; otherwise use $FACT_MERGE")]
         tool: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -1187,7 +1300,10 @@ enum Command {
             help = "Match any requested tag or all requested tags"
         )]
         tag_match: TagMatch,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
         #[arg(
             long,
@@ -1225,7 +1341,10 @@ enum Command {
         with: Option<String>,
         #[arg(long, help = "Select one result by its 1-based list number")]
         pick: Option<usize>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(alias = "log")]
@@ -1241,7 +1360,10 @@ enum Command {
         limit: Option<usize>,
         #[arg(long, help = "Resume after this content-hash cursor")]
         after: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -1255,7 +1377,10 @@ enum Command {
         file: Option<PathBuf>,
         #[arg(long, help = "The configured remote to send data to")]
         remote: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(
@@ -1265,7 +1390,7 @@ enum Command {
     Pull {
         #[arg(help = "A local database to update (advanced use)")]
         database: Option<PathBuf>,
-        #[arg(help = "Use a particular local ledger")]
+        #[arg(help = "Use a ledger name, remote name, UUID, or short reference")]
         ledger: Option<String>,
         #[arg(help = "A bundle file to create or read (advanced use)")]
         output: Option<PathBuf>,
@@ -1288,6 +1413,27 @@ enum Command {
     Identity {
         #[command(subcommand)]
         command: IdentityCommand,
+    },
+    #[command(
+        about = "Exchange actors with remote ledger administrators",
+        display_order = 11
+    )]
+    Actor {
+        #[command(subcommand)]
+        command: ActorCommand,
+    },
+    #[command(
+        about = "Manage reusable local actor profile metadata",
+        display_order = 95
+    )]
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+    #[command(about = "Manage reusable local signing personas", display_order = 94)]
+    Persona {
+        #[command(subcommand)]
+        command: PersonaCommand,
     },
     #[command(
         hide = true,
@@ -1315,6 +1461,7 @@ enum Command {
         command: RemoteCommand,
     },
     #[command(
+        hide = true,
         about = "Run and administer a Facts HTTP collaboration server",
         display_order = 55
     )]
@@ -1394,6 +1541,304 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum ActorCommand {
+    #[command(about = "Create or switch a ledger actor")]
+    New {
+        #[arg(help = "Display name to register, or alias to switch to")]
+        name: Option<String>,
+        #[arg(short = 'a', long, help = "Stable directory alias for the actor")]
+        alias: Option<String>,
+        #[arg(long, help = "Apply a FACT_HOME actor profile")]
+        profile: Option<String>,
+        #[arg(long = "type", help = "Actor type: human, agent, or service")]
+        actor_type: Option<String>,
+        #[arg(long, help = "Role or responsibility label")]
+        role: Option<String>,
+        #[arg(
+            long,
+            value_name = "CAPABILITY",
+            action = ArgAction::Append,
+            help = "Capability to grant when creating a new actor"
+        )]
+        permission: Vec<String>,
+        #[arg(
+            long,
+            help = "Grant participation capabilities: propose, deliberate, comment, accept, reject"
+        )]
+        participate: bool,
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
+        ledger: Option<String>,
+    },
+    #[command(about = "List ledger actors")]
+    List {
+        #[arg(
+            long,
+            default_value_t = 100,
+            help = "Maximum rows to show; use 0 for no limit"
+        )]
+        limit: usize,
+        #[arg(long, default_value_t = 0, help = "Number of rows to skip")]
+        offset: usize,
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
+        ledger: Option<String>,
+    },
+    #[command(about = "Show one ledger actor")]
+    Show {
+        #[arg(help = "Actor ID, short ref, directory alias, or display name")]
+        actor: String,
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
+        ledger: Option<String>,
+    },
+    #[command(about = "Use a local actor for future writes in a ledger")]
+    Use {
+        #[arg(help = "Actor ID, directory alias, or display name")]
+        actor: String,
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
+        ledger: Option<String>,
+    },
+    #[command(about = "Name or rename a ledger actor")]
+    Name {
+        #[arg(help = "Actor ID, directory alias, or display name")]
+        actor: String,
+        #[arg(help = "Display name for the actor")]
+        name: String,
+        #[arg(long, help = "Stable directory alias for the actor")]
+        alias: Option<String>,
+        #[arg(long = "type", help = "Actor type: human, agent, or service")]
+        actor_type: Option<String>,
+        #[arg(long, help = "Role or responsibility label")]
+        role: Option<String>,
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
+        ledger: Option<String>,
+    },
+    #[command(about = "Grant ledger capabilities to an actor")]
+    Grant {
+        #[arg(help = "Actor ID, alias, or display name")]
+        actor: String,
+        #[arg(long = "capability", help = "Capability to grant; repeat for more")]
+        capabilities: Vec<String>,
+        #[arg(
+            long,
+            help = "Grant participation capabilities: propose, deliberate, comment, accept, reject"
+        )]
+        participate: bool,
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
+        ledger: Option<String>,
+    },
+    #[command(about = "Revoke a ledger capability grant")]
+    Revoke {
+        #[arg(help = "Grant ID to revoke")]
+        grant: String,
+        #[arg(long, help = "A short explanation for removing the grant")]
+        reason: Option<String>,
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
+        ledger: Option<String>,
+    },
+    #[command(about = "Create a remote ledger admission request")]
+    Send {
+        #[arg(help = "Display name or stable local actor name")]
+        name: Option<String>,
+        #[arg(long, help = "Stable alias claimed by this actor")]
+        alias: Option<String>,
+        #[arg(long, help = "Apply a FACT_HOME actor profile")]
+        profile: Option<String>,
+        #[arg(long = "type", help = "Actor type: human, agent, or service")]
+        actor_type: Option<String>,
+        #[arg(
+            long = "request",
+            help = "Capability requested from the remote admin; repeat for more"
+        )]
+        requests: Vec<String>,
+        #[arg(
+            long,
+            help = "Request participation capabilities: propose, deliberate, comment, accept, reject"
+        )]
+        participate: bool,
+        #[arg(
+            long,
+            short = 'o',
+            help = "Where to write the request artifact (default: ALIAS.actor.json)"
+        )]
+        output: Option<PathBuf>,
+    },
+    #[command(about = "Inspect a remote ledger admission request")]
+    Inspect {
+        #[arg(help = "A remote actor request artifact")]
+        file: PathBuf,
+    },
+    #[command(about = "Import, name, recognize, and grant a remote actor")]
+    Admit {
+        #[arg(conflicts_with = "input", help = "A remote actor request artifact")]
+        file: Option<PathBuf>,
+        #[arg(
+            long,
+            short = 'i',
+            help = "Read request artifact from FILE, or - for standard input"
+        )]
+        input: Option<PathBuf>,
+        #[arg(long, help = "Override the requested display name")]
+        name: Option<String>,
+        #[arg(long, help = "Override the requested alias")]
+        alias: Option<String>,
+        #[arg(long = "type", help = "Override the requested actor type")]
+        actor_type: Option<String>,
+        #[arg(long = "capability", help = "Capability to grant; repeat for more")]
+        capabilities: Vec<String>,
+        #[arg(
+            long,
+            help = "Grant participation capabilities: propose, deliberate, comment, accept, reject"
+        )]
+        participate: bool,
+        #[arg(long, help = "Also issue an HTTP bearer token")]
+        with_token: bool,
+        #[arg(long, requires = "with_token", help = "Token expiry in days")]
+        token_expires_days: Option<i64>,
+        #[arg(long, requires = "with_token", help = "Operator label for the token")]
+        token_label: Option<String>,
+        #[arg(
+            long,
+            requires = "with_token",
+            help = "Path to the server token SQLite database"
+        )]
+        token_store: Option<PathBuf>,
+        #[arg(long, short = 'o', help = "Where to write the response artifact")]
+        output: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
+        ledger: Option<String>,
+        #[arg(
+            long,
+            help = "Configured remote name or URL to include in the response endpoint"
+        )]
+        remote: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileCommand {
+    #[command(about = "Create a reusable local actor profile")]
+    Add {
+        #[arg(help = "Profile name")]
+        profile: String,
+        #[arg(long, help = "Display name to apply in ledgers")]
+        name: String,
+        #[arg(long, help = "Stable alias to apply in ledgers")]
+        alias: Option<String>,
+        #[arg(
+            long = "type",
+            default_value = "human",
+            help = "Actor type: human, agent, or service"
+        )]
+        actor_type: String,
+        #[arg(long, help = "Role or responsibility label")]
+        role: Option<String>,
+        #[arg(long, help = "Make this the default profile")]
+        default: bool,
+    },
+    #[command(about = "List reusable local actor profiles")]
+    List,
+    #[command(about = "Show one reusable local actor profile")]
+    Show {
+        #[arg(help = "Profile name")]
+        profile: String,
+    },
+    #[command(about = "Update a reusable local actor profile")]
+    Update {
+        #[arg(help = "Profile name")]
+        profile: String,
+        #[arg(long, help = "Display name to apply in ledgers")]
+        name: Option<String>,
+        #[arg(long, help = "Stable alias to apply in ledgers")]
+        alias: Option<String>,
+        #[arg(long, help = "Clear the stored alias")]
+        clear_alias: bool,
+        #[arg(long = "type", help = "Actor type: human, agent, or service")]
+        actor_type: Option<String>,
+        #[arg(long, help = "Role or responsibility label")]
+        role: Option<String>,
+        #[arg(long, help = "Clear the stored role")]
+        clear_role: bool,
+    },
+    #[command(about = "Delete a reusable local actor profile")]
+    Delete {
+        #[arg(help = "Profile name")]
+        profile: String,
+    },
+    #[command(about = "Set the default reusable local actor profile")]
+    Default {
+        #[arg(help = "Profile name")]
+        profile: String,
+    },
+    #[command(about = "Apply a profile to ledger directory entries")]
+    Apply {
+        #[arg(help = "Profile name; defaults to the configured default profile")]
+        profile: Option<String>,
+        #[arg(
+            long,
+            action = ArgAction::Append,
+            help = "Ledger to update; repeat to update multiple ledgers"
+        )]
+        ledger: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PersonaCommand {
+    #[command(about = "Create a reusable local signing persona")]
+    Add {
+        #[arg(help = "Persona name")]
+        persona: String,
+        #[arg(long, help = "Display name for status and directory metadata")]
+        name: String,
+        #[arg(long, help = "Stable alias for status and directory metadata")]
+        alias: Option<String>,
+        #[arg(
+            long = "type",
+            default_value = "human",
+            help = "Actor type: human, agent, or service"
+        )]
+        actor_type: String,
+        #[arg(long, help = "Make this the default persona for new ledgers")]
+        default: bool,
+    },
+    #[command(about = "List reusable local signing personas")]
+    List,
+    #[command(about = "Show one reusable local signing persona")]
+    Show {
+        #[arg(help = "Persona name, actor ID, short ref, or alias")]
+        persona: String,
+    },
+    #[command(about = "Set the default reusable local signing persona")]
+    Default {
+        #[arg(help = "Persona name, actor ID, short ref, or alias")]
+        persona: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum InvitationsCommand {
     #[command(about = "List all invitations for the active actor")]
     List,
@@ -1432,7 +1877,10 @@ enum IdentityCommand {
             help = "Actor type: human, agent, or service"
         )]
         actor_type: String,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "List imported actor identities")]
@@ -1445,35 +1893,55 @@ enum IdentityCommand {
         limit: usize,
         #[arg(long, default_value_t = 0, help = "Number of rows to skip")]
         offset: usize,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Show one imported actor identity")]
     Show {
         #[arg(help = "Actor ID, short ref, directory alias, or display name")]
         actor: String,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Use a local identity for future writes in a ledger")]
     Use {
         #[arg(help = "Actor ID, directory alias, or display name")]
         actor: String,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
-    #[command(about = "Import identity keys without granting permissions")]
+    #[command(about = "Import public identity objects without granting permissions")]
     Import {
-        #[arg(help = "A file containing the identity key material")]
+        #[arg(help = "A file containing public identity objects")]
         file: PathBuf,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
-    #[command(about = "Export identity keys for backup or transfer")]
+    #[command(about = "Export public identity objects safe to transmit")]
     Export {
-        #[arg(value_name = "FILE", help = "Where to write the identity key material")]
+        #[arg(
+            value_name = "FILE",
+            help = "Where to write public identity objects; private seeds stay under .facts/identities"
+        )]
         file: Option<PathBuf>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(long, help = "Actor ID, short ref, directory alias, or display name")]
+        actor: Option<String>,
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Recognize an identity and grant it capabilities")]
@@ -1490,7 +1958,10 @@ enum IdentityCommand {
             help = "Grant participation capabilities: propose, deliberate, comment, accept, reject"
         )]
         participate: bool,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Remove a previously granted authority record")]
@@ -1499,12 +1970,18 @@ enum IdentityCommand {
         grant: String,
         #[arg(long, help = "A short explanation for removing the grant")]
         reason: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Create a new signing key while retaining the old key for history")]
     Rotate {
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
 }
@@ -1557,7 +2034,10 @@ enum DirectoryCommand {
             help = "Path to the server token SQLite database"
         )]
         token_store: Option<PathBuf>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "List friendly directory entries")]
@@ -1570,14 +2050,20 @@ enum DirectoryCommand {
         limit: usize,
         #[arg(long, default_value_t = 0, help = "Number of rows to skip")]
         offset: usize,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Show one friendly directory entry")]
     Show {
         #[arg(help = "Actor ID, alias, or display name")]
         reference: String,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Update a friendly directory entry")]
@@ -1598,56 +2084,85 @@ enum DirectoryCommand {
         source: Option<String>,
         #[arg(long, help = "Who verified this directory entry")]
         verified_by: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Remove a friendly directory entry")]
     Delete {
         #[arg(help = "Actor ID, alias, or display name")]
         reference: String,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Resolve an actor ID, alias, or display name")]
     Resolve {
         #[arg(help = "Actor ID, directory alias, or display name")]
         reference: String,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Import a directory extension bundle")]
     Import {
         #[arg(help = "Directory extension bundle file")]
         file: PathBuf,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Export a directory extension bundle")]
     Export {
         #[arg(help = "Directory extension bundle file to write")]
         file: PathBuf,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Write directory extension state to a bundle")]
     Push {
         #[arg(help = "Directory extension bundle file to write")]
         file: PathBuf,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Read directory extension state from a bundle")]
     Pull {
         #[arg(help = "Directory extension bundle file to read")]
         file: PathBuf,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
 }
 #[derive(Subcommand)]
 enum PermissionCommand {
     #[command(about = "List grantable permission capabilities")]
-    Capabilities,
+    Capabilities {
+        #[arg(help = "Actor ID, short ref, directory alias, or display name to inspect")]
+        actor: Option<String>,
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
+        ledger: Option<String>,
+    },
     #[command(about = "Grant capabilities to an identity")]
     Grant {
         #[arg(long, help = "The actor or identity receiving permission")]
@@ -1662,7 +2177,10 @@ enum PermissionCommand {
             help = "Grant participation capabilities: propose, deliberate, comment, accept, reject"
         )]
         participate: bool,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
     #[command(about = "Revoke a permission grant")]
@@ -1684,7 +2202,10 @@ enum PermissionCommand {
         participate: bool,
         #[arg(long, help = "A short explanation for removing the grant")]
         reason: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
 }
@@ -1698,6 +2219,15 @@ enum RemoteCommand {
         name: String,
         #[arg(help = "The URL of the remote ledger service")]
         url: String,
+        #[arg(long, help = "Ledger name, remote name, UUID, or short reference")]
+        ledger: Option<String>,
+    },
+    #[command(about = "Configure a remote from a descriptor")]
+    From {
+        #[arg(help = "A remote descriptor, or an actor response containing one")]
+        file: PathBuf,
+        #[arg(help = "A short name used to refer to this remote")]
+        name: Option<String>,
     },
     #[command(about = "Forget a configured remote")]
     Remove {
@@ -1715,11 +2245,23 @@ enum RemoteCommand {
     Auth {
         #[arg(help = "The configured remote name")]
         name: String,
-        #[arg(long, help = "Read the bearer token from stdin")]
+        #[arg(
+            short = 'i',
+            long,
+            value_name = "FILE",
+            conflicts_with_all = ["stdin", "token", "clear"],
+            help = "Read the bearer token from FILE, or - for stdin"
+        )]
+        input: Option<PathBuf>,
+        #[arg(
+            long,
+            conflicts_with_all = ["input", "token", "clear"],
+            help = "Read the bearer token from stdin"
+        )]
         stdin: bool,
         #[arg(
             long,
-            conflicts_with = "stdin",
+            conflicts_with_all = ["input", "stdin", "token"],
             help = "Forget the remote bearer token"
         )]
         clear: bool,
@@ -1734,7 +2276,10 @@ enum HttpCommand {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787", help = "Address to bind")]
         bind: String,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
         #[arg(long, help = "Serve every writable local ledger in the catalog")]
         all: bool,
@@ -1756,7 +2301,10 @@ enum HttpTokenCommand {
     Issue {
         #[arg(long, help = "Actor ID; defaults to the active ledger actor")]
         actor: Option<String>,
-        #[arg(long, help = "Ledger ID; defaults to the active ledger")]
+        #[arg(
+            long,
+            help = "Ledger name, remote name, UUID, or short reference; defaults to the active ledger"
+        )]
         ledger: Option<String>,
         #[arg(long, help = "Token expiry in days")]
         expires_days: Option<i64>,
@@ -1764,6 +2312,15 @@ enum HttpTokenCommand {
         label: Option<String>,
         #[arg(long, help = "Path to the server token SQLite database")]
         token_store: Option<PathBuf>,
+        #[arg(
+            short = 'o',
+            long,
+            value_name = "FILE",
+            help = "Write the bearer token to FILE, or - for stdout"
+        )]
+        output: Option<PathBuf>,
+        #[arg(long, help = "Include the bearer token in JSON output")]
+        show_token: bool,
     },
     #[command(about = "List issued HTTP bearer token metadata")]
     List {
@@ -1792,7 +2349,10 @@ enum LedgerCommand {
         source: String,
         #[arg(help = "The friendly name for the local copy")]
         name: String,
-        #[arg(long, help = "The ledger ID to copy from a remote URL")]
+        #[arg(
+            long,
+            help = "The ledger to copy by name, remote name, UUID, or short reference"
+        )]
         ledger: String,
     },
     #[command(about = "Delete a local ledger")]
@@ -1817,6 +2377,11 @@ enum LedgerCommand {
     },
     #[command(about = "List local ledgers")]
     List,
+    #[command(about = "Show details for one local ledger")]
+    Show {
+        #[arg(help = "The ledger to show by name, remote name, UUID, or short reference")]
+        ledger: String,
+    },
     #[command(about = "Initialize a ledger database at an exact path")]
     Init {
         #[arg(help = "Where to create the ledger database")]
@@ -1881,7 +2446,10 @@ enum ReconcileCommand {
         file: Option<PathBuf>,
         #[arg(long, help = "Use this short Markdown text instead of a file")]
         message: Option<String>,
-        #[arg(long, help = "Use a particular local ledger")]
+        #[arg(
+            long,
+            help = "Use a ledger name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
     },
 }
@@ -1903,7 +2471,9 @@ enum ObjectCommand {
     Export {
         #[arg(help = "The local database to read")]
         database: PathBuf,
-        #[arg(help = "The ledger ID containing the object")]
+        #[arg(
+            help = "The ledger containing the object, by name, remote name, UUID, or short reference"
+        )]
         ledger: String,
         #[arg(help = "The object ID to export")]
         id: String,
@@ -1957,7 +2527,7 @@ enum QueryCommand {
     Search {
         #[arg(help = "The local database to search")]
         database: PathBuf,
-        #[arg(help = "The ledger ID to search")]
+        #[arg(help = "The ledger to search, by name, remote name, UUID, or short reference")]
         ledger: String,
         #[arg(help = "A file describing the search query")]
         file: PathBuf,
@@ -1981,7 +2551,10 @@ enum SyncCommand {
         file: PathBuf,
         #[arg(long, help = "The configured remote to send data to")]
         remote: Option<String>,
-        #[arg(long, help = "The ledger to send")]
+        #[arg(
+            long,
+            help = "The ledger to send by name, remote name, UUID, or short reference"
+        )]
         ledger: Option<String>,
         #[arg(long, hide = true)]
         bearer_token: Option<String>,
@@ -1990,7 +2563,7 @@ enum SyncCommand {
     Pull {
         #[arg(help = "The local database to update")]
         database: PathBuf,
-        #[arg(help = "The ledger ID to update")]
+        #[arg(help = "The ledger to update, by name, remote name, UUID, or short reference")]
         ledger: String,
         #[arg(help = "The bundle file to read or create")]
         output: PathBuf,
@@ -2021,7 +2594,9 @@ enum DeliberationCommand {
     Open {
         #[arg(help = "The local database to update")]
         database: PathBuf,
-        #[arg(help = "The ledger ID containing the proposition")]
+        #[arg(
+            help = "The ledger containing the proposition, by name, remote name, UUID, or short reference"
+        )]
         ledger: String,
         #[arg(help = "The proposition revision to discuss")]
         revision: String,
@@ -2036,7 +2611,9 @@ enum DeliberationCommand {
     Inspect {
         #[arg(help = "The local database to read")]
         database: PathBuf,
-        #[arg(help = "The ledger ID containing the discussion")]
+        #[arg(
+            help = "The ledger containing the discussion, by name, remote name, UUID, or short reference"
+        )]
         ledger: String,
         #[arg(help = "The discussion ID to inspect")]
         deliberation: String,
@@ -2045,7 +2622,9 @@ enum DeliberationCommand {
     Participants {
         #[arg(help = "The local database to read")]
         database: PathBuf,
-        #[arg(help = "The ledger ID containing the discussion")]
+        #[arg(
+            help = "The ledger containing the discussion, by name, remote name, UUID, or short reference"
+        )]
         ledger: String,
         #[arg(help = "The discussion ID to inspect")]
         deliberation: String,
@@ -2057,7 +2636,9 @@ enum DecisionCommand {
     Cast {
         #[arg(help = "The local database to update")]
         database: PathBuf,
-        #[arg(help = "The ledger ID containing the discussion")]
+        #[arg(
+            help = "The ledger containing the discussion, by name, remote name, UUID, or short reference"
+        )]
         ledger: String,
         #[arg(help = "The discussion ID receiving the decision")]
         deliberation: String,
@@ -2077,7 +2658,7 @@ enum PropositionCommand {
     Propose {
         #[arg(help = "The local database to update")]
         database: PathBuf,
-        #[arg(help = "The ledger ID to update")]
+        #[arg(help = "The ledger to update, by name, remote name, UUID, or short reference")]
         ledger: String,
         #[arg(help = "The author actor ID")]
         actor: String,
@@ -2092,7 +2673,9 @@ enum PropositionCommand {
     Revisions {
         #[arg(help = "The local database to read")]
         database: PathBuf,
-        #[arg(help = "The ledger ID containing the proposition")]
+        #[arg(
+            help = "The ledger containing the proposition, by name, remote name, UUID, or short reference"
+        )]
         ledger: String,
         #[arg(help = "The proposition ID to inspect")]
         proposition: String,
@@ -2101,7 +2684,9 @@ enum PropositionCommand {
     Inspect {
         #[arg(help = "The local database to read")]
         database: PathBuf,
-        #[arg(help = "The ledger ID containing the proposition")]
+        #[arg(
+            help = "The ledger containing the proposition, by name, remote name, UUID, or short reference"
+        )]
         ledger: String,
         #[arg(help = "The proposition ID to inspect")]
         proposition: String,
@@ -2110,7 +2695,9 @@ enum PropositionCommand {
     Deliberations {
         #[arg(help = "The local database to read")]
         database: PathBuf,
-        #[arg(help = "The ledger ID containing the proposition")]
+        #[arg(
+            help = "The ledger containing the proposition, by name, remote name, UUID, or short reference"
+        )]
         ledger: String,
         #[arg(help = "The proposition ID to inspect")]
         proposition: String,
@@ -2119,7 +2706,9 @@ enum PropositionCommand {
     Comments {
         #[arg(help = "The local database to read")]
         database: PathBuf,
-        #[arg(help = "The ledger ID containing the proposition")]
+        #[arg(
+            help = "The ledger containing the proposition, by name, remote name, UUID, or short reference"
+        )]
         ledger: String,
         #[arg(help = "The proposition ID to inspect")]
         proposition: String,
@@ -2157,15 +2746,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Help { command, all } => {
             print_help(&command, all, pager_policy)?;
         }
-        Command::Capabilities
+        Command::Capabilities { actor, ledger }
         | Command::Permission {
-            command: PermissionCommand::Capabilities,
+            command: PermissionCommand::Capabilities { actor, ledger },
         } => {
             let environment = UserEnvironment::discover()?;
-            let active = environment
-                .resolve(None)
-                .ok()
-                .and_then(|entry| held_capabilities(&entry).ok().map(|held| (entry, held)));
+            let active = match environment.resolve(ledger.as_deref()) {
+                Ok(mut entry) => {
+                    if let Some(actor) = actor {
+                        let actor_id =
+                            fact_sdk::workflow::resolve_directory_actor_reference(&entry, &actor)?;
+                        entry.actor_id = actor_id.to_string();
+                    }
+                    held_capabilities(&entry).ok().map(|held| (entry, held))
+                }
+                Err(_) => None,
+            };
             print_capabilities(cli.json, active.as_ref())?;
         }
         Command::As {
@@ -2173,6 +2769,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             alias,
             self_actor,
             actor_type,
+            profile,
             role,
             source,
             verified_by,
@@ -2190,6 +2787,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 alias,
                 self_actor,
                 actor_type,
+                profile,
                 role,
                 source,
                 verified_by,
@@ -2207,11 +2805,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|actor| actor.get("display_name"))
                 .and_then(|display_name| display_name.as_str())
                 .unwrap_or("identity");
-            let ledger = value
+            let actor_alias = value
+                .get("actor")
+                .and_then(|actor| actor.get("alias"))
+                .and_then(|alias| alias.as_str());
+            let actor_display = actor_alias
+                .map(|alias| format!("{actor} ({alias})"))
+                .unwrap_or_else(|| actor.to_owned());
+            let ledger_name = value
                 .get("ledger")
                 .and_then(|ledger| ledger.get("name"))
                 .and_then(|name| name.as_str())
                 .unwrap_or("ledger");
+            let ledger = value
+                .get("ledger")
+                .and_then(|ledger| ledger.get("ledger_id"))
+                .and_then(|ledger_id| ledger_id.as_str())
+                .and_then(|ledger_id| uuid::Uuid::parse_str(ledger_id).ok())
+                .map(|ledger_id| {
+                    format!(
+                        "{ledger_name} ({})",
+                        fact_sdk::reference::short_uuid_reference(ledger_id)
+                    )
+                })
+                .unwrap_or_else(|| ledger_name.to_owned());
             let human = if value.get("report").and_then(|report| report.as_bool()) == Some(true) {
                 if value.get("actor").is_some_and(serde_json::Value::is_null) {
                     let suffix = if value
@@ -2226,7 +2843,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     format!("no current signer for ledger {ledger}{suffix}")
                 } else {
-                    format!("current signer for ledger {ledger}: {actor}")
+                    format!("current signer for ledger {ledger}: {actor_display}")
                 }
             } else if value
                 .get("self")
@@ -2239,20 +2856,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             print_json_or(cli.json, value, human);
         }
-        Command::Init { name } => {
+        Command::Init { name, persona } => {
             let environment = UserEnvironment::discover()?;
             let name = name.unwrap_or_else(|| "default".to_owned());
-            let (entry, _) = environment::ensure_user_ledger(&environment, &name)?;
+            let (entry, created, persona_used) =
+                ensure_user_ledger_with_persona(&environment, &name, persona.as_deref())?;
+            let directory_entry_created =
+                ensure_initial_admin_directory_entry(&environment, &entry, created)?;
             let active = environment::use_ledger(&environment, &name)?;
             print_json_or(
                 cli.json,
-                serde_json::json!({"initialized":true,"active":active.name,"ledger_id":entry.ledger_id,"actor_id":entry.actor_id}),
+                serde_json::json!({"initialized":true,"active":active.name,"ledger_id":entry.ledger_id,"actor_id":entry.actor_id,"persona":persona_used,"directory_entry_created":directory_entry_created}),
                 format!("initialized ledger {} ({})", entry.name, entry.ledger_id),
             );
         }
         Command::Here {
             path,
             init,
+            persona,
             no_switch,
             force,
             print_env,
@@ -2265,7 +2886,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let (environment, created) = initialize_here_environment(&root, force)?;
             let fact_home_set = env::var_os("FACT_HOME").is_some();
             let ledger = if let Some(name) = init {
-                let (entry, created) = environment::ensure_user_ledger(&environment, &name)?;
+                let (entry, created, persona_used) =
+                    ensure_user_ledger_with_persona(&environment, &name, persona.as_deref())?;
+                let directory_entry_created =
+                    ensure_initial_admin_directory_entry(&environment, &entry, created)?;
                 let active = if no_switch {
                     false
                 } else {
@@ -2277,7 +2901,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "name":entry.name,
                     "active":active,
                     "ledger_id":entry.ledger_id,
-                    "actor_id":entry.actor_id
+                    "actor_id":entry.actor_id,
+                    "persona":persona_used,
+                    "directory_entry_created":directory_entry_created
                 }))
             } else {
                 None
@@ -2329,10 +2955,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", lines.join("\n"));
             }
         }
-        Command::New { name } => {
+        Command::New { name, persona } => {
             let environment = UserEnvironment::discover()?;
             let name = name.unwrap_or_else(|| "default".to_owned());
-            let (entry, created) = environment::ensure_user_ledger(&environment, &name)?;
+            let (entry, created, persona_used) =
+                ensure_user_ledger_with_persona(&environment, &name, persona.as_deref())?;
+            let directory_entry_created =
+                ensure_initial_admin_directory_entry(&environment, &entry, created)?;
             let active = environment.active_name()?;
             let message = if created {
                 format!("created ledger {} ({})", entry.name, entry.ledger_id)
@@ -2346,6 +2975,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "name":entry.name,
                     "ledger_id":entry.ledger_id,
                     "actor_id":entry.actor_id,
+                    "persona":persona_used,
+                    "directory_entry_created":directory_entry_created,
                     "active":active,
                     "active_changed":false
                 }),
@@ -2355,21 +2986,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Clone {
             source,
             remote,
+            descriptor,
             ledger,
             name,
             actor,
         } => {
             let environment = UserEnvironment::discover()?;
-            let source = clone_source_from_args(&environment, source, remote)?;
-            let ledger_id = environment::clone_source_ledger_id(&source.url, ledger.as_deref())?;
+            let source = clone_source_from_args(&environment, source, remote, descriptor)?;
+            let requested_ledger = ledger
+                .as_deref()
+                .map(|value| environment.resolve_ledger_id(value))
+                .transpose()?
+                .or_else(|| source.ledger.clone());
+            let ledger_id =
+                environment::clone_source_ledger_id(&source.url, requested_ledger.as_deref())?;
             let name = match name {
                 Some(name) => name,
                 None => environment::clone_source_name(&environment, &source.name_source)?,
             };
-            let actor = actor
-                .as_deref()
-                .map(|actor| clone_actor_binding(&environment, actor))
-                .transpose()?;
+            let actor = match actor.as_deref() {
+                Some(actor) => Some(clone_actor_binding(&environment, actor)?),
+                None => inferred_clone_actor_binding(&environment, &source)?,
+            };
             let entry = clone_read_only_ledger(&environment, &name, &source, &ledger_id, actor)?;
             let remote_json = source
                 .remote_name
@@ -2392,10 +3030,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "read_only":entry.read_only,
                     "active":true,
                     "remote":remote_json,
+                    "descriptor_contains_credential":source.from_descriptor && source.bearer_token.is_some(),
                     "actor_id":if entry.actor_id.is_empty() {serde_json::Value::Null} else {serde_json::Value::String(entry.actor_id.clone())},
                     "key_id":if entry.key_id.is_empty() {serde_json::Value::Null} else {serde_json::Value::String(entry.key_id.clone())}
                 }),
-                if entry.read_only {
+                if source.from_descriptor && source.bearer_token.is_some() {
+                    format!(
+                        "cloned {} ledger {}; descriptor file still contains a live credential",
+                        if entry.read_only {
+                            "read-only"
+                        } else {
+                            "writable"
+                        },
+                        entry.name
+                    )
+                } else if entry.read_only {
                     format!("cloned read-only ledger {}", entry.name)
                 } else {
                     format!(
@@ -2415,11 +3064,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Some(name) => name,
                 None => environment::clone_source_name(&environment, &database.to_string_lossy())?,
             };
+            let requested_ledger = ledger
+                .as_deref()
+                .map(|value| environment.resolve_ledger_id(value))
+                .transpose()?;
             let entry = environment::register_read_only_ledger_database(
                 &environment,
                 &name,
                 &database,
-                ledger.as_deref(),
+                requested_ledger.as_deref(),
             )?;
             environment.set_active(&name)?;
             print_json_or(
@@ -2455,7 +3108,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let markdown = read_or_edit_markdown(file, message.as_deref())?;
             let outcome = create_user_proposition(
                 &entry,
-                &environment.read_seed(&entry)?,
+                &read_seed_for_write(&environment, &entry)?,
                 &markdown,
                 decision.map(|value| match value {
                     DecisionChoice::Accept => "accepted",
@@ -2471,9 +3124,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Deliberate { reference, ledger } => {
             let environment = UserEnvironment::discover()?;
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
-            let value = if let Some(value) =
-                open_missing_user_deliberation(&entry, &environment.read_seed(&entry)?, &reference)?
-            {
+            let value = if let Some(value) = open_missing_user_deliberation(
+                &entry,
+                &read_seed_for_write(&environment, &entry)?,
+                &reference,
+            )? {
                 value
             } else {
                 user_deliberation(&entry, &reference)?
@@ -2522,7 +3177,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let content = read_or_edit_markdown(file, message.as_deref())?;
             let value = create_user_comment(
                 &entry,
-                &environment.read_seed(&entry)?,
+                &read_seed_for_write(&environment, &entry)?,
                 &reference,
                 &content,
             )?;
@@ -2655,7 +3310,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
             let outcome = decide_user_proposition(
                 &entry,
-                &environment.read_seed(&entry)?,
+                &read_seed_for_write(&environment, &entry)?,
                 reference.as_deref(),
                 "accepted",
             )?;
@@ -2674,7 +3329,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
             let value = create_user_invitation(
                 &entry,
-                &environment.read_seed(&entry)?,
+                &read_seed_for_write(&environment, &entry)?,
                 &reference,
                 &actor,
             )?;
@@ -2731,7 +3386,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Some(InvitationsCommand::Accept { reference }) => {
                     let value = create_user_participant_join_from_invitation(
                         &entry,
-                        &environment.read_seed(&entry)?,
+                        &read_seed_for_write(&environment, &entry)?,
                         &reference,
                     )?;
                     print_json_or(
@@ -2743,7 +3398,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Some(InvitationsCommand::Reject { reference, reason }) => {
                     let value = reject_user_invitation(
                         &entry,
-                        &environment.read_seed(&entry)?,
+                        &read_seed_for_write(&environment, &entry)?,
                         &reference,
                         reason
                             .as_deref()
@@ -2770,14 +3425,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let value = if let Some(invitation) = invitation {
                 create_user_participant_join(
                     &entry,
-                    &environment.read_seed(&entry)?,
+                    &read_seed_for_write(&environment, &entry)?,
                     &reference,
                     &invitation,
                 )?
             } else {
                 create_user_participant_join_from_invitation(
                     &entry,
-                    &environment.read_seed(&entry)?,
+                    &read_seed_for_write(&environment, &entry)?,
                     &reference,
                 )?
             };
@@ -2790,8 +3445,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Leave { reference, ledger } => {
             let environment = UserEnvironment::discover()?;
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
-            let value =
-                create_user_participant_leave(&entry, &environment.read_seed(&entry)?, &reference)?;
+            let value = create_user_participant_leave(
+                &entry,
+                &read_seed_for_write(&environment, &entry)?,
+                &reference,
+            )?;
             print_json_or(
                 cli.json,
                 value.clone(),
@@ -2807,7 +3465,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
             let value = create_user_lifecycle(
                 &entry,
-                &environment.read_seed(&entry)?,
+                &read_seed_for_write(&environment, &entry)?,
                 &reference,
                 "withdraw",
                 reason
@@ -2825,7 +3483,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
             let value = create_user_lifecycle(
                 &entry,
-                &environment.read_seed(&entry)?,
+                &read_seed_for_write(&environment, &entry)?,
                 &reference,
                 "archive",
                 reason
@@ -2839,7 +3497,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
             let outcome = decide_user_proposition(
                 &entry,
-                &environment.read_seed(&entry)?,
+                &read_seed_for_write(&environment, &entry)?,
                 reference.as_deref(),
                 "rejected",
             )?;
@@ -2906,7 +3564,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let markdown = read_or_edit_markdown(file, message.as_deref())?;
             let outcome = create_user_proposition(
                 &entry,
-                &environment.read_seed(&entry)?,
+                &read_seed_for_write(&environment, &entry)?,
                 &markdown,
                 decision.map(|value| match value {
                     DecisionChoice::Accept => "accepted",
@@ -2940,7 +3598,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let outcome = revise_user_proposition(
                 &entry,
-                &environment.read_seed(&entry)?,
+                &read_seed_for_write(&environment, &entry)?,
                 &reference,
                 &markdown,
             )?;
@@ -2970,28 +3628,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 fact_sdk::workflow::pending_proposition_count(&entry)?
             };
             let remotes = environment.load_remotes()?;
+            let persona = persona_for_actor(&environment, &entry.actor_id)?;
+            let persona_name = persona.as_ref().map(|(name, _)| name.clone());
+            let local_private_key_material =
+                !entry.read_only && !entry.actor_id.is_empty() && entry.seed_file.is_file();
+            let missing_key_warning =
+                !entry.read_only && !entry.actor_id.is_empty() && !local_private_key_material;
             let value = serde_json::json!({
                 "ledger_name":entry.name,
                 "ledger_id":entry.ledger_id,
                 "database":entry.database,
                 "actor_id":entry.actor_id,
                 "key_id":entry.key_id,
+                "persona":persona_name,
                 "read_only":entry.read_only,
+                "local_private_key_material":local_private_key_material,
                 "pending_actions":pending_count,
-                "remotes":remotes.values().collect::<Vec<_>>(),
+                "remotes":scoped_remotes(remotes.values(), &entry.ledger_id),
                 "synchronization":{"state":"local-only","last_push":null,"last_pull":null}
             });
-            print_json_or(
-                cli.json,
-                value,
-                format!(
-                    "{}  {}  {} pending action(s), {} remote(s)",
+            print_json_or(cli.json, value, {
+                let mut output = format!(
+                    "{}  {}  {} pending action(s), {} remote(s){}",
                     entry.name,
-                    entry.ledger_id,
+                    short_uuid_string(&entry.ledger_id),
                     pending_count,
-                    remotes.len()
-                ),
-            );
+                    scoped_remotes(remotes.values(), &entry.ledger_id).len(),
+                    persona_name
+                        .map(|name| format!("  persona {name}"))
+                        .unwrap_or_default()
+                );
+                if missing_key_warning {
+                    output.push_str(
+                            "\nwarning: local private key material is missing; writes will fail until the identity key is restored or rotated",
+                        );
+                }
+                output
+            });
         }
         Command::List {
             status,
@@ -3222,7 +3895,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             format!("{} requires at least one tag", operation.as_str()).into()
                         );
                     }
-                    let seed = environment.read_seed(&entry)?;
+                    let seed = read_seed_for_write(&environment, &entry)?;
                     fact_sdk::workflow::mutate_tags(&entry, &seed, &reference, operation, &tags)?
                 };
                 if cli.json {
@@ -3257,7 +3930,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
             let outcome = create_user_reconciliation(
                 &entry,
-                &environment.read_seed(&entry)?,
+                &read_seed_for_write(&environment, &entry)?,
                 ReconciliationCliInput {
                     affected,
                     common_ancestor,
@@ -3295,7 +3968,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
             let outcome = resolve_user_conflict(
                 &entry,
-                &environment.read_seed(&entry)?,
+                &read_seed_for_write(&environment, &entry)?,
                 ResolveCliInput {
                     reference,
                     file,
@@ -3481,7 +4154,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     output,
                 },
         } => {
-            let ledger = parse_uuid7(&ledger, "ledger")?;
+            let ledger = resolve_ledger_uuid(&ledger)?;
             let id = parse_uuid7(&id, "object")?;
             let store = fact_store::Store::open(database)?;
             let result = fact_sdk::sync::export_object(&store, ledger, id)?;
@@ -3544,19 +4217,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let environment = UserEnvironment::discover()?;
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
             let store = fact_store::Store::open(&entry.database)?;
+            let directory_entries = directory_entries_by_actor(&entry)?;
             let mut items = Vec::new();
             for (id, _, object_type) in store.list_identity_objects()? {
                 if object_type != "actor" {
                     continue;
                 }
                 let local_seed = environment.identity_dir.join(format!("{id}.seed")).exists();
-                let directory =
-                    fact_sdk::workflow::resolve_directory_reference(&entry, &id.to_string()).ok();
+                let key_id = identity_actor_key_id(&store, id)?;
+                let directory = directory_entries.get(&id);
+                let capabilities = actor_capabilities_in_store(&store, &entry, id)?;
+                let persona = persona_for_actor(&environment, &id.to_string())?;
+                let admin = capabilities.iter().any(|capability| capability == "admin");
                 items.push(serde_json::json!({
                     "actor_id":id,
                     "actor_ref":fact_sdk::reference::short_uuid_reference(id),
+                    "key_id":key_id,
+                    "key_ref":key_id.map(fact_sdk::reference::short_uuid_reference),
+                    "persona":persona.as_ref().map(|(name, _)| name.clone()),
                     "display_name":directory.as_ref().map(|item| item.display_name.clone()),
                     "alias":directory.as_ref().and_then(|item| item.alias.clone()),
+                    "capabilities":capabilities,
+                    "admin":admin,
                     "local_private_key_material":local_seed,
                     "active":entry.actor_id == id.to_string()
                 }));
@@ -3572,16 +4254,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("no identities");
             } else {
                 for item in &items {
-                    let name = item["display_name"].as_str().unwrap_or("unnamed");
+                    let name = item["display_name"].as_str().unwrap_or("No name");
+                    let key = item["key_ref"].as_str().unwrap_or("-");
+                    let alias = item["alias"].as_str().unwrap_or("No alias");
                     let active = if item["active"].as_bool() == Some(true) {
                         "  active"
                     } else {
                         ""
                     };
+                    let capabilities = item["capabilities"]
+                        .as_array()
+                        .map(|capabilities| {
+                            capabilities
+                                .iter()
+                                .filter_map(|capability| capability.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .filter(|capabilities| !capabilities.is_empty())
+                        .map(|capabilities| format!("  {capabilities}"))
+                        .unwrap_or_default();
                     println!(
-                        "{}  {}{}",
+                        "{}  {}  {}  {}{}{}",
                         item["actor_ref"].as_str().unwrap(),
+                        key,
                         name,
+                        alias,
+                        capabilities,
                         active
                     );
                 }
@@ -3598,24 +4297,45 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .identity_dir
                 .join(format!("{actor_id}.seed"))
                 .exists();
-            let directory =
-                fact_sdk::workflow::resolve_directory_reference(&entry, &actor_id.to_string()).ok();
+            let directory_entries = directory_entries_by_actor(&entry)?;
+            let directory = directory_entries.get(&actor_id);
+            let capabilities = actor_capabilities_in_store(&store, &entry, actor_id)?;
+            let key_id = identity_actor_key_id(&store, actor_id)?;
+            let persona = persona_for_actor(&environment, &actor_id.to_string())?;
             let value = serde_json::json!({
                 "actor_id":actor_id,
                 "actor_ref":fact_sdk::reference::short_uuid_reference(actor_id),
+                "key_id":key_id,
+                "key_ref":key_id.map(fact_sdk::reference::short_uuid_reference),
+                "persona":persona.as_ref().map(|(name, _)| name.clone()),
                 "display_name":directory.as_ref().map(|item| item.display_name.clone()),
                 "alias":directory.as_ref().and_then(|item| item.alias.clone()),
+                "capabilities":capabilities,
                 "local_private_key_material":local_seed,
                 "active":entry.actor_id == actor_id.to_string(),
                 "imported":store.get_cose_by_id_any(actor_id.as_bytes())?.is_some()
             });
+            let capabilities = value["capabilities"]
+                .as_array()
+                .map(|capabilities| {
+                    capabilities
+                        .iter()
+                        .filter_map(|capability| capability.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|capabilities| !capabilities.is_empty())
+                .unwrap_or_else(|| "none".to_owned());
             print_json_or(
                 cli.json,
                 value.clone(),
                 format!(
-                    "{}  {}",
+                    "{}  {}\nkey: {}\npersona: {}\ncapabilities: {}",
                     value["actor_ref"].as_str().unwrap_or("-"),
-                    value["display_name"].as_str().unwrap_or("unnamed")
+                    value["display_name"].as_str().unwrap_or("unnamed"),
+                    value["key_ref"].as_str().unwrap_or("-"),
+                    value["persona"].as_str().unwrap_or("-"),
+                    capabilities
                 ),
             );
         }
@@ -3623,29 +4343,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             command: IdentityCommand::Use { actor, ledger },
         } => {
             let environment = UserEnvironment::discover()?;
-            let requested_name = ledger
-                .clone()
-                .or_else(|| environment.active_name().ok().flatten())
-                .ok_or("no active ledger; pass --ledger NAME")?;
+            let entry = ensure_active_entry(&environment, ledger.as_deref())?;
+            let requested_name = entry.name.clone();
             let mut entries = environment.load()?;
-            let entry = entries
-                .get(&requested_name)
-                .cloned()
-                .ok_or_else(|| format!("unknown ledger: {requested_name}"))?;
             let resolved = fact_sdk::workflow::resolve_directory_reference(&entry, &actor)?;
-            let seed_file = environment
-                .identity_dir
-                .join(format!("{}.seed", resolved.actor_id));
-            if !seed_file.exists() {
-                return Err(format!(
-                    "local private key material is not available for {}",
-                    resolved.actor_id
-                )
-                .into());
-            }
+            let store = fact_store::Store::open(&entry.database)?;
             let key_id = resolved
                 .key_id
-                .ok_or("directory entry has no signing key")?;
+                .or(identity_actor_key_id(&store, resolved.actor_id)?)
+                .ok_or_else(|| {
+                    user_error(format!(
+                        "actor {} has no signing key association",
+                        resolved.actor_id
+                    ))
+                })?;
+            let seed_file = local_identity_seed_file(&environment, resolved.actor_id, key_id)?;
             let updated = LedgerEntry {
                 actor_id: resolved.actor_id.to_string(),
                 key_id: key_id.to_string(),
@@ -3683,7 +4395,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let capabilities = expanded_capabilities(capabilities, participate)?;
             let value = recognize_user_identity(
                 &entry,
-                &environment.read_seed(&entry)?,
+                &read_seed_for_write(&environment, &entry)?,
                 &actor,
                 &capabilities,
             )?;
@@ -3708,7 +4420,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
             let value = revoke_user_grant(
                 &entry,
-                &environment.read_seed(&entry)?,
+                &read_seed_for_write(&environment, &entry)?,
                 &grant,
                 reason
                     .as_deref()
@@ -3725,7 +4437,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let environment = UserEnvironment::discover()?;
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
-            let seed = environment.read_seed(&entry)?;
+            let seed = read_seed_for_write(&environment, &entry)?;
             let value = rotate_user_identity(&environment, &entry, &seed)?;
             print_json_or(
                 cli.json,
@@ -3733,6 +4445,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 format!("rotated signing key to {}", value["key_id"]),
             );
         }
+        Command::Actor { command } => handle_actor_command(cli.json, command)?,
+        Command::Profile { command } => handle_profile_command(cli.json, command)?,
+        Command::Persona { command } => handle_persona_command(cli.json, command)?,
         Command::Directory {
             command:
                 DirectoryCommand::Add {
@@ -3755,7 +4470,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let environment = UserEnvironment::discover()?;
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
-            let seed = environment.read_seed(&entry)?;
+            let seed = read_seed_for_write(&environment, &entry)?;
             let actor_id = if self_actor {
                 Some(uuid::Uuid::parse_str(&entry.actor_id)?)
             } else {
@@ -3814,7 +4529,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             let mut value = serde_json::to_value(&result)?;
             if let Some(access_token) = &access_token {
-                value["access_token"] = access_token_json(access_token);
+                value["access_token"] = access_token_json(access_token, false);
             }
             print_json_or(
                 cli.json,
@@ -3848,17 +4563,44 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .take(if limit == 0 { usize::MAX } else { limit })
                 .collect::<Vec<_>>();
             if cli.json {
+                let store = fact_store::Store::open(&entry.database)?;
+                let entries = entries
+                    .into_iter()
+                    .map(|item| {
+                        let capabilities =
+                            actor_capabilities_in_store(&store, &entry, item.actor_id)?;
+                        let admin = capabilities.iter().any(|capability| capability == "admin");
+                        let mut value = serde_json::to_value(item)?;
+                        if let Some(object) = value.as_object_mut() {
+                            object
+                                .insert("capabilities".to_owned(), serde_json::json!(capabilities));
+                            object.insert("admin".to_owned(), serde_json::json!(admin));
+                        }
+                        Ok::<_, Box<dyn std::error::Error>>(value)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 println!("{}", serde_json::to_string_pretty(&entries)?);
             } else if entries.is_empty() {
                 println!("no directory entries");
             } else {
+                let store = fact_store::Store::open(&entry.database)?;
                 for item in &entries {
                     let alias = item
                         .alias
                         .as_ref()
                         .map(|alias| format!("  @{alias}"))
                         .unwrap_or_default();
-                    println!("{}  {}{}", item.actor_ref, item.display_name, alias);
+                    let capabilities =
+                        actor_capabilities_in_store(&store, &entry, item.actor_id)?.join(", ");
+                    let capabilities = if capabilities.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {capabilities}")
+                    };
+                    println!(
+                        "{}  {}{}{}",
+                        item.actor_ref, item.display_name, alias, capabilities
+                    );
                 }
             }
         }
@@ -3890,7 +4632,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let environment = UserEnvironment::discover()?;
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
-            let seed = environment.read_seed(&entry)?;
+            let seed = read_seed_for_write(&environment, &entry)?;
             let existing = fact_sdk::workflow::show_directory_entry(&entry, &reference)?;
             let key_id = key
                 .as_deref()
@@ -3991,7 +4733,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let capabilities = expanded_capabilities(capabilities, participate)?;
             let value = recognize_user_identity(
                 &entry,
-                &environment.read_seed(&entry)?,
+                &read_seed_for_write(&environment, &entry)?,
                 &identity,
                 &capabilities,
             )?;
@@ -4013,7 +4755,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let environment = UserEnvironment::discover()?;
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
-            let seed = environment.read_seed(&entry)?;
+            let seed = read_seed_for_write(&environment, &entry)?;
             let reason = reason
                 .as_deref()
                 .unwrap_or("authority revoked by ledger administrator");
@@ -4051,19 +4793,47 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&remotes)?);
             } else {
                 for remote in &remotes {
-                    println!("{}  {}", remote.name, remote.url);
+                    print_remote(remote);
                 }
             }
         }
         Command::Remote {
-            command: RemoteCommand::Add { name, url },
+            command: RemoteCommand::Add { name, url, ledger },
         } => {
             let environment = UserEnvironment::discover()?;
-            let result = environment::add_remote(&environment, &name, &url)?;
+            let ledger = remote_add_ledger(&environment, &url, ledger.as_deref())?;
+            let result = add_remote_with_ledger(&environment, &name, &url, ledger)?;
             print_json_or(
                 cli.json,
-                serde_json::json!({"added":true,"name":result.name,"url":result.url,"scope":result.scope}),
+                serde_json::json!({"added":true,"name":result.name,"url":result.url,"ledger":result.ledger,"scope":result.scope}),
                 format!("added remote {name} {url}"),
+            );
+        }
+        Command::Remote {
+            command: RemoteCommand::From { file, name },
+        } => {
+            let environment = UserEnvironment::discover()?;
+            let result = configure_remote_from_descriptor(&environment, &file, name.as_deref())?;
+            let contains_credential = result.bearer_token.is_some();
+            print_json_or(
+                cli.json,
+                serde_json::json!({
+                    "configured":true,
+                    "name":result.name,
+                    "url":result.url,
+                    "ledger":result.ledger,
+                    "genesis_hash":result.genesis_hash,
+                    "contains_credential":contains_credential,
+                    "scope":"local-environment"
+                }),
+                if contains_credential {
+                    format!(
+                        "configured remote {}; descriptor file still contains a live credential",
+                        result.name
+                    )
+                } else {
+                    format!("configured remote {}", result.name)
+                },
             );
         }
         Command::Remote {
@@ -4092,24 +4862,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             command:
                 RemoteCommand::Auth {
                     name,
+                    input,
                     stdin,
                     clear,
                     token,
                 },
         } => {
             let environment = UserEnvironment::discover()?;
-            let bearer_token =
-                if clear {
-                    None
-                } else if stdin {
-                    let mut value = String::new();
-                    io::stdin().read_to_string(&mut value)?;
-                    Some(value.trim().to_owned())
-                } else {
-                    Some(token.ok_or_else(|| {
-                        user_error("remote auth requires TOKEN, --stdin, or --clear")
-                    })?)
-                };
+            let bearer_token = if clear {
+                None
+            } else if let Some(input) = input {
+                Some(read_bearer_token_input(&input)?)
+            } else if stdin {
+                let mut value = String::new();
+                io::stdin().read_to_string(&mut value)?;
+                Some(value.trim().to_owned())
+            } else {
+                Some(token.ok_or_else(|| {
+                    user_error("remote auth requires TOKEN, --input, --stdin, or --clear")
+                })?)
+            };
             let result = environment::set_remote_bearer_token(&environment, &name, bearer_token)?;
             print_json_or(
                 cli.json,
@@ -4158,7 +4930,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|entry| {
                     let store = fact_store::Store::open(&entry.database)?;
-                    let seed = environment.read_seed(entry)?;
+                    let seed = read_seed_for_write(&environment, entry)?;
                     let coordinator_key = fact_crypto::SigningKey::from_seed(&seed)?;
                     let ledger_id = entry.ledger_id.parse::<fact_core::ObjectId>()?;
                     let coordinator_actor_id = entry.actor_id.parse::<fact_core::ObjectId>()?;
@@ -4215,8 +4987,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 name_source: source.clone(),
                 url: source.clone(),
                 remote_name: None,
+                ledger: None,
+                genesis_hash: None,
                 bearer_token: None,
+                actor: None,
+                claims: None,
+                from_descriptor: false,
             };
+            let ledger = environment.resolve_ledger_id(&ledger)?;
             let entry = clone_read_only_ledger(&environment, &name, &source, &ledger, None)?;
             environment.set_active(&name)?;
             print_json_or(
@@ -4235,7 +5013,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             command: LedgerCommand::Delete { name, force },
         } => {
             let environment = UserEnvironment::discover()?;
+            let persona_seed = environment
+                .load()
+                .ok()
+                .and_then(|entries| entries.get(&name).cloned())
+                .and_then(|entry| {
+                    persona_for_actor(&environment, &entry.actor_id)
+                        .ok()
+                        .flatten()
+                        .map(|(_, _)| entry.seed_file)
+                })
+                .and_then(|seed_file| fs::read(&seed_file).ok().map(|bytes| (seed_file, bytes)));
             let result = environment::delete_ledger(&environment, &name, force)?;
+            if let Some((seed_file, bytes)) = persona_seed {
+                if !seed_file.exists() {
+                    if let Some(parent) = seed_file.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    write_sensitive_file(&seed_file, &bytes)?;
+                }
+            }
             print_json_or(
                 cli.json,
                 serde_json::to_value(&result)?,
@@ -4250,11 +5047,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let environment = UserEnvironment::discover()?;
             let remotes = environment::list_remotes(&environment)?;
+            let entry = ensure_active_entry(&environment, None)?;
+            let remotes = scoped_remotes(&remotes, &entry.ledger_id);
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&remotes)?);
             } else {
-                for remote in &remotes {
-                    println!("{}  {}", remote.name, remote.url);
+                for remote in remotes {
+                    print_remote(remote);
                 }
             }
         }
@@ -4286,7 +5085,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             (None, None) => {
                 let environment = UserEnvironment::discover()?;
                 let entry = ensure_active_entry(&environment, ledger.as_deref())?;
-                let remote = configured_remote(&environment, remote.as_deref())?;
+                let remote = configured_remote_for_ledger(&environment, remote.as_deref(), &entry)?;
                 personal_push(&entry, &remote, cli.json)?;
             }
             _ => return Err("fact push requires both DATABASE and FILE, or neither".into()),
@@ -4349,12 +5148,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let environment = UserEnvironment::discover()?;
                     if personal_ledger.is_none() && environment.active_name()?.is_none() {
                         return Err(
-                            "no local ledger is active; use `fact clone --remote NAME --ledger LEDGER_ID` first"
+                            "no local ledger is active; use `fact clone --remote NAME --ledger LEDGER` first"
                                 .into(),
                         );
                     }
                     let entry = ensure_active_entry(&environment, personal_ledger.as_deref())?;
-                    let remote = configured_remote(&environment, remote.as_deref())?;
+                    let remote =
+                        configured_remote_for_ledger(&environment, remote.as_deref(), &entry)?;
                     personal_pull(&entry, &remote, cli.json)?;
                 }
                 _ => return Err("fact pull requires DATABASE, LEDGER, and OUTPUT, or none".into()),
@@ -4366,33 +5166,73 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let environment = UserEnvironment::discover()?;
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
             let bytes = fs::read(file)?;
-            let result = fact_sdk::workflow::import_identity(&entry, &bytes)?;
+            let import = read_identity_import_bundle(&bytes)?;
+            let mut result = fact_sdk::workflow::import_identity(&entry, &import.identity_bundle)?;
+            let directory_result = import
+                .directory_bundle
+                .as_deref()
+                .map(|bundle| fact_sdk::workflow::import_directory(&entry, bundle))
+                .transpose()?;
+            for actor in &mut result.actors {
+                if actor.display_name.is_none() {
+                    if let Ok(directory) = fact_sdk::workflow::resolve_directory_reference(
+                        &entry,
+                        &actor.actor_id.to_string(),
+                    ) {
+                        actor.display_name = Some(directory.display_name);
+                    }
+                }
+            }
             print_json_or(
                 cli.json,
-                serde_json::to_value(&result)?,
-                format!(
-                    "imported {} identity object(s); recognition and authority remain separate",
-                    result.imported
-                ),
+                identity_import_result_value(&result, directory_result.as_ref())?,
+                format_identity_import_result(&result, directory_result.as_ref()),
             );
         }
         Command::Identity {
-            command: IdentityCommand::Export { file, ledger },
+            command:
+                IdentityCommand::Export {
+                    file,
+                    actor,
+                    ledger,
+                },
         } => {
             let environment = UserEnvironment::discover()?;
             let entry = ensure_active_entry(&environment, ledger.as_deref())?;
+            let actor_id = actor
+                .as_deref()
+                .map(|actor| fact_sdk::workflow::resolve_directory_actor_reference(&entry, actor))
+                .transpose()?;
             let file = match file {
                 Some(file) => file,
-                None => default_identity_export_file(&entry)?,
+                None => default_identity_export_file(&entry, actor_id)?,
             };
-            let result = fact_sdk::workflow::export_identity(&entry)?;
-            fs::write(&file, &result.bundle)?;
+            let result = if let Some(actor_id) = actor_id {
+                let scoped_entry = identity_export_entry_for_actor(&environment, &entry, actor_id)?;
+                fact_sdk::workflow::export_identity_for_actor(&scoped_entry, actor_id)?
+            } else {
+                fact_sdk::workflow::export_identity(&entry)?
+            };
+            let actors = identity_bundle_actor_values(&result.bundle)?;
+            let actor_ids = actors
+                .iter()
+                .filter_map(|actor| actor["actor_id"].as_str())
+                .filter_map(|actor| uuid::Uuid::parse_str(actor).ok())
+                .collect::<Vec<_>>();
+            let bundle = identity_export_bundle_with_directory(&entry, &result.bundle, &actor_ids)?;
+            fs::write(&file, &bundle)?;
+            let actor_text = actors
+                .iter()
+                .map(|actor| actor["actor_ref"].as_str().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join(", ");
             print_json_or(
                 cli.json,
-                serde_json::json!({"exported":result.exported,"objects":result.objects,"private_key_material":result.private_key_material,"file":file}),
+                serde_json::json!({"exported":result.exported,"objects":result.objects,"actors":actors,"private_key_material":result.private_key_material,"file":file}),
                 format!(
-                    "exported {} identity object(s) to {}",
+                    "exported {} identity object(s) for {} to {}",
                     result.objects,
+                    actor_text,
                     file.display()
                 ),
             );
@@ -4404,10 +5244,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 },
         } => {
             let environment = UserEnvironment::discover()?;
-            let result = environment::add_remote(&environment, &name, &url)?;
+            let entry = ensure_active_entry(&environment, None)?;
+            let result =
+                add_remote_with_ledger(&environment, &name, &url, Some(entry.ledger_id.clone()))?;
             print_json_or(
                 cli.json,
-                serde_json::json!({"added":true,"name":result.name,"url":result.url}),
+                serde_json::json!({"added":true,"name":result.name,"url":result.url,"ledger":result.ledger}),
                 format!("added remote {name} {url}"),
             );
         }
@@ -4463,11 +5305,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "{}{}  {}  {} remote(s)",
                         if entry.active { "* " } else { "  " },
                         entry.name,
-                        entry.ledger_id,
+                        short_uuid_string(&entry.ledger_id),
                         entry.remote_count
                     );
                 }
             }
+        }
+        Command::Ledger {
+            command: LedgerCommand::Show { ledger },
+        } => {
+            let environment = UserEnvironment::discover()?;
+            let entry = environment.resolve(Some(&ledger))?;
+            let value = ledger_show_value(&environment, &entry)?;
+            print_ledger_show(cli.json, &value)?;
         }
         Command::Ledger {
             command:
@@ -4595,7 +5445,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     file,
                 },
         } => {
-            let ledger = parse_uuid7(&ledger, "ledger")?;
+            let ledger = resolve_ledger_uuid(&ledger)?;
             let input = fs::read(file)?;
             let store = fact_store::Store::open(database)?;
             let output = fact_sdk::workflow::query_search(&store, ledger, &input)?;
@@ -4641,12 +5491,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("sync push requires a FACTBNDL or FACTSNAP file".into());
             }
             if let Some(remote) = remote {
-                let ledger = parse_uuid7(
+                let ledger = resolve_ledger_uuid(
                     ledger
                         .as_deref()
                         .ok_or("--ledger is required with --remote")?,
-                    "ledger",
                 )?;
+                validate_remote_serves_ledger(&remote, ledger)?;
                 let endpoint = format!(
                     "{}/facts/ledgers/{}/object-pushes",
                     remote.trim_end_matches('/'),
@@ -4707,9 +5557,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     bearer_token,
                 },
         } => {
-            let ledger = parse_uuid7(&ledger, "ledger")?;
+            let ledger = resolve_ledger_uuid(&ledger)?;
             let explicit_known = known_hashes.map(|path| read_hashes(&path)).transpose()?;
             if let Some(remote) = remote {
+                validate_remote_serves_ledger(&remote, ledger)?;
                 let known = match explicit_known {
                     Some(hashes) => hashes.into_iter().collect::<std::collections::HashSet<_>>(),
                     None if database.exists() => {
@@ -4865,6 +5716,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     seed,
                 },
         } => {
+            let ledger = resolve_ledger_uuid(&ledger)?.to_string();
             let revision = parse_uuid7(&revision, "revision")?;
             let seed = hex::decode(seed)?;
             let seed: [u8; 32] = seed
@@ -4902,7 +5754,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     deliberation,
                 },
         } => {
-            let ledger = parse_uuid7(&ledger, "ledger")?;
+            let ledger = resolve_ledger_uuid(&ledger)?;
             let deliberation = parse_uuid7(&deliberation, "deliberation")?;
             let entry = LedgerEntry {
                 name: "technical".to_owned(),
@@ -4940,7 +5792,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     deliberation,
                 },
         } => {
-            let ledger = parse_uuid7(&ledger, "ledger")?;
+            let ledger = resolve_ledger_uuid(&ledger)?;
             let deliberation = parse_uuid7(&deliberation, "deliberation")?;
             let entry = LedgerEntry {
                 name: "technical".to_owned(),
@@ -4986,6 +5838,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     seed,
                 },
         } => {
+            let ledger = resolve_ledger_uuid(&ledger)?.to_string();
             if value != "accepted" && value != "rejected" {
                 return Err("decision value must be accepted or rejected".into());
             }
@@ -5040,6 +5893,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     file,
                 },
         } => {
+            let ledger = resolve_ledger_uuid(&ledger)?.to_string();
             let markdown = fs::read(&file)?;
             fact_canonical::validate_canonical_markdown(&markdown)?;
             let seed = hex::decode(seed)?;
@@ -5077,6 +5931,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     proposition,
                 },
         } => {
+            let ledger = resolve_ledger_uuid(&ledger)?.to_string();
             let entry = LedgerEntry {
                 name: "technical".to_owned(),
                 ledger_id: ledger,
@@ -5114,6 +5969,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     proposition,
                 },
         } => {
+            let ledger = resolve_ledger_uuid(&ledger)?.to_string();
             let entry = LedgerEntry {
                 name: "technical".to_owned(),
                 ledger_id: ledger,
@@ -5174,6 +6030,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     proposition,
                 },
         } => {
+            let ledger = resolve_ledger_uuid(&ledger)?.to_string();
             let entry = LedgerEntry {
                 name: "technical".to_owned(),
                 ledger_id: ledger,
@@ -5212,6 +6069,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     revision,
                 },
         } => {
+            let ledger = resolve_ledger_uuid(&ledger)?.to_string();
             let revision = revision
                 .as_deref()
                 .map(|value| parse_uuid7(value, "revision"))
@@ -5251,7 +6109,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Conformance {
             command: ConformanceCommand::Run { path },
         } => {
-            let report = fact_sdk::workflow::run_conformance(path.as_deref());
+            let mut report = fact_sdk::workflow::run_conformance(path.as_deref());
+            report.implementation_version = env!("CARGO_PKG_VERSION").to_owned();
             println!(
                 "{}",
                 if cli.json {
@@ -5349,6 +6208,8 @@ fn validate_here_environment(root: &Path, force: bool) -> Result<(), Box<dyn std
         OsStr::new("catalog.toml"),
         OsStr::new("identities"),
         OsStr::new("ledgers"),
+        OsStr::new("personas.toml"),
+        OsStr::new("profiles.toml"),
         OsStr::new("remotes.toml"),
     ];
     for entry in fs::read_dir(root)? {
@@ -5372,6 +6233,20 @@ fn validate_here_environment(root: &Path, force: bool) -> Result<(), Box<dyn std
         return Err(user_error(format!(
             "{} exists but is not a file",
             remotes.display()
+        )));
+    }
+    let profiles = root.join("profiles.toml");
+    if profiles.exists() && !profiles.is_file() && !force {
+        return Err(user_error(format!(
+            "{} exists but is not a file",
+            profiles.display()
+        )));
+    }
+    let personas = root.join("personas.toml");
+    if personas.exists() && !personas.is_file() && !force {
+        return Err(user_error(format!(
+            "{} exists but is not a file",
+            personas.display()
         )));
     }
     let active = root.join("active");
@@ -5405,13 +6280,58 @@ fn print_json_or(json: bool, value: serde_json::Value, human: String) {
     }
 }
 
+fn read_bearer_token_input(input: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let mut value = String::new();
+    if input == Path::new("-") {
+        io::stdin().read_to_string(&mut value)?;
+    } else {
+        value = fs::read_to_string(input)?;
+    }
+    Ok(value.trim().to_owned())
+}
+
+fn write_file_with_mode(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    options.mode(mode);
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    set_file_mode(path, mode)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_file_mode(path: &Path, mode: u32) -> Result<(), Box<dyn std::error::Error>> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_file_mode(_path: &Path, _mode: u32) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
+fn write_bearer_token_file(output: &Path, token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    write_file_with_mode(output, token.as_bytes(), 0o600)
+}
+
+fn write_sensitive_file(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    write_file_with_mode(path, bytes, 0o600)
+}
+
 fn token_store_path(environment: &UserEnvironment, override_path: Option<PathBuf>) -> PathBuf {
     override_path.unwrap_or_else(|| {
         environment
             .remote_file
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join("access")
+            .join("remotes")
             .join("tokens.sqlite")
     })
 }
@@ -5428,6 +6348,8 @@ fn handle_http_token_command(
             expires_days,
             label,
             token_store,
+            output,
+            show_token,
         } => {
             let entry = environment.resolve(ledger.as_deref())?;
             let actor_id = match actor {
@@ -5444,13 +6366,22 @@ fn handle_http_token_command(
                 label,
                 token_store,
             )?;
+            if let Some(output) = output.as_deref().filter(|path| *path != Path::new("-")) {
+                write_bearer_token_file(output, &issued.issued.token)?;
+            }
+            let token_to_stdout = output.as_deref() == Some(Path::new("-"));
+            let mut value = access_token_json(&issued, show_token || token_to_stdout);
+            if let Some(output) = &output {
+                value["credential_output"] = serde_json::json!(if output == Path::new("-") {
+                    "stdout".to_owned()
+                } else {
+                    output.display().to_string()
+                });
+            }
             print_json_or(
                 json,
-                access_token_json(&issued),
-                format!(
-                    "issued token {}\n{}",
-                    issued.issued.record.token_id, issued.issued.token
-                ),
+                value,
+                issued_http_token_human_output(&issued, output.as_deref()),
             );
         }
         HttpTokenCommand::List { token_store } => {
@@ -5557,17 +6488,1887 @@ fn http_token_expires_at(
         .transpose()
 }
 
-fn access_token_json(token: &IssuedHttpActorToken) -> serde_json::Value {
+fn access_token_json(token: &IssuedHttpActorToken, include_secret: bool) -> serde_json::Value {
     let issued = &token.issued;
-    serde_json::json!({
-        "token":issued.token,
+    let mut value = serde_json::json!({
         "token_id":issued.record.token_id,
         "actor_id":issued.record.actor_id.to_string(),
         "ledger_id":issued.record.ledger_id.map(|ledger| ledger.to_string()),
         "expires_at":issued.record.expires_at.map(format_http_time),
         "label":issued.record.label.clone(),
         "token_store":token.token_store.clone()
+    });
+    if include_secret {
+        value["token"] = serde_json::json!(issued.token);
+    }
+    value
+}
+
+fn issued_http_token_human_output(token: &IssuedHttpActorToken, output: Option<&Path>) -> String {
+    let issued = &token.issued;
+    let mut lines = vec![
+        format!("issued token {}", issued.record.token_id),
+        format!("actor {}", issued.record.actor_id),
+        format!(
+            "ledger {}",
+            issued
+                .record
+                .ledger_id
+                .map(|ledger| ledger.to_string())
+                .unwrap_or_else(|| "-".to_owned())
+        ),
+    ];
+    if let Some(label) = &issued.record.label {
+        lines.push(format!("label {label}"));
+    }
+    match output {
+        Some(path) if path != Path::new("-") => {
+            lines.push(format!("wrote credential {}", path.display()));
+        }
+        _ => {
+            lines.push(issued.token.clone());
+            lines.push("shown only once; store it now".to_owned());
+        }
+    }
+    lines.join("\n")
+}
+
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+struct ActorRegistry {
+    actors: std::collections::BTreeMap<String, ActorRegistryEntry>,
+}
+
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+struct ProfileFile {
+    #[serde(default)]
+    default: Option<String>,
+    #[serde(default)]
+    profiles: std::collections::BTreeMap<String, ActorProfile>,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct ActorProfile {
+    display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    alias: Option<String>,
+    actor_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+}
+
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+struct PersonaFile {
+    #[serde(default)]
+    default: Option<String>,
+    #[serde(default)]
+    personas: std::collections::BTreeMap<String, PersonaEntry>,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct PersonaEntry {
+    display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    alias: Option<String>,
+    actor_type: String,
+    ledger_id: String,
+    actor_id: String,
+    key_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_bundle: Option<String>,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct ActorRegistryEntry {
+    name: String,
+    alias: Option<String>,
+    actor_type: String,
+    ledger_id: String,
+    actor_id: String,
+    key_id: String,
+}
+
+#[derive(Clone)]
+struct ActorRequestIdentity {
+    name: String,
+    alias: Option<String>,
+    actor_type: String,
+    ledger_id: String,
+    database: PathBuf,
+    actor_id: String,
+    key_id: String,
+    seed_file: PathBuf,
+}
+
+#[derive(Clone)]
+struct ActorBundleIdentity {
+    actor_id: uuid::Uuid,
+    key_id: uuid::Uuid,
+    fingerprint: String,
+}
+
+struct ActorRequestReview {
+    request: actor_exchange::ActorRequest,
+    bundle: Vec<u8>,
+    identity: ActorBundleIdentity,
+    filename_mismatch: Option<String>,
+}
+
+fn profile_path(environment: &UserEnvironment) -> PathBuf {
+    environment.root().join("profiles.toml")
+}
+
+fn load_profiles(environment: &UserEnvironment) -> Result<ProfileFile, Box<dyn std::error::Error>> {
+    match fs::read_to_string(profile_path(environment)) {
+        Ok(text) => Ok(toml::from_str(&text)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ProfileFile::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_profiles(
+    environment: &UserEnvironment,
+    profiles: &ProfileFile,
+) -> Result<(), Box<dyn std::error::Error>> {
+    environment.ensure_dirs()?;
+    fs::write(profile_path(environment), toml::to_string_pretty(profiles)?)?;
+    Ok(())
+}
+
+fn named_profile(
+    environment: &UserEnvironment,
+    name: &str,
+) -> Result<ActorProfile, Box<dyn std::error::Error>> {
+    let profiles = load_profiles(environment)?;
+    profiles
+        .profiles
+        .get(name)
+        .cloned()
+        .ok_or_else(|| user_error(format!("unknown profile: {name}")))
+}
+
+fn default_profile(
+    environment: &UserEnvironment,
+) -> Result<Option<(String, ActorProfile)>, Box<dyn std::error::Error>> {
+    let profiles = load_profiles(environment)?;
+    let Some(name) = profiles.default else {
+        return Ok(None);
+    };
+    let profile = profiles
+        .profiles
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| user_error(format!("default profile is missing: {name}")))?;
+    Ok(Some((name, profile)))
+}
+
+fn profile_json(name: &str, profile: &ActorProfile, default: bool) -> serde_json::Value {
+    serde_json::json!({
+        "profile":name,
+        "display_name":profile.display_name,
+        "alias":profile.alias,
+        "actor_type":profile.actor_type,
+        "role":profile.role,
+        "default":default
     })
+}
+
+fn handle_profile_command(
+    json: bool,
+    command: ProfileCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let environment = UserEnvironment::discover()?;
+    match command {
+        ProfileCommand::Add {
+            profile,
+            name,
+            alias,
+            actor_type,
+            role,
+            default,
+        } => {
+            validate_profile_name(&profile)?;
+            let mut profiles = load_profiles(&environment)?;
+            if profiles.profiles.contains_key(&profile) {
+                return Err(user_error(format!("profile already exists: {profile}")));
+            }
+            let value = ActorProfile {
+                display_name: name,
+                alias,
+                actor_type,
+                role,
+            };
+            profiles.profiles.insert(profile.clone(), value.clone());
+            if default || profiles.default.is_none() {
+                profiles.default = Some(profile.clone());
+            }
+            save_profiles(&environment, &profiles)?;
+            let is_default = profiles.default.as_deref() == Some(profile.as_str());
+            print_json_or(
+                json,
+                profile_json(&profile, &value, is_default),
+                format!("added profile {profile}"),
+            );
+        }
+        ProfileCommand::List => {
+            let profiles = load_profiles(&environment)?;
+            let items = profiles
+                .profiles
+                .iter()
+                .map(|(name, profile)| {
+                    profile_json(
+                        name,
+                        profile,
+                        profiles.default.as_deref() == Some(name.as_str()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if json {
+                println!("{}", serde_json::json!(items));
+            } else if items.is_empty() {
+                println!("no profiles");
+            } else {
+                for item in items {
+                    println!(
+                        "{}  {}{}{}",
+                        item["profile"].as_str().unwrap(),
+                        item["display_name"].as_str().unwrap(),
+                        item["alias"]
+                            .as_str()
+                            .map(|alias| format!("  @{alias}"))
+                            .unwrap_or_default(),
+                        if item["default"].as_bool() == Some(true) {
+                            "  default"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+        }
+        ProfileCommand::Show { profile } => {
+            let profiles = load_profiles(&environment)?;
+            let value = profiles
+                .profiles
+                .get(&profile)
+                .ok_or_else(|| user_error(format!("unknown profile: {profile}")))?;
+            let is_default = profiles.default.as_deref() == Some(profile.as_str());
+            print_json_or(
+                json,
+                profile_json(&profile, value, is_default),
+                format!(
+                    "{}  {}{}{}",
+                    profile,
+                    value.display_name,
+                    value
+                        .alias
+                        .as_ref()
+                        .map(|alias| format!("  @{alias}"))
+                        .unwrap_or_default(),
+                    if is_default { "  default" } else { "" }
+                ),
+            );
+        }
+        ProfileCommand::Update {
+            profile,
+            name,
+            alias,
+            clear_alias,
+            actor_type,
+            role,
+            clear_role,
+        } => {
+            let mut profiles = load_profiles(&environment)?;
+            let value = profiles
+                .profiles
+                .get_mut(&profile)
+                .ok_or_else(|| user_error(format!("unknown profile: {profile}")))?;
+            if let Some(name) = name {
+                value.display_name = name;
+            }
+            if clear_alias {
+                value.alias = None;
+            } else if alias.is_some() {
+                value.alias = alias;
+            }
+            if let Some(actor_type) = actor_type {
+                value.actor_type = actor_type;
+            }
+            if clear_role {
+                value.role = None;
+            } else if role.is_some() {
+                value.role = role;
+            }
+            let output = value.clone();
+            save_profiles(&environment, &profiles)?;
+            print_json_or(
+                json,
+                profile_json(
+                    &profile,
+                    &output,
+                    profiles.default.as_deref() == Some(profile.as_str()),
+                ),
+                format!("updated profile {profile}"),
+            );
+        }
+        ProfileCommand::Delete { profile } => {
+            let mut profiles = load_profiles(&environment)?;
+            if profiles.profiles.remove(&profile).is_none() {
+                return Err(user_error(format!("unknown profile: {profile}")));
+            }
+            if profiles.default.as_deref() == Some(profile.as_str()) {
+                profiles.default = None;
+            }
+            save_profiles(&environment, &profiles)?;
+            print_json_or(
+                json,
+                serde_json::json!({"deleted":true,"profile":profile}),
+                format!("deleted profile {profile}"),
+            );
+        }
+        ProfileCommand::Default { profile } => {
+            let mut profiles = load_profiles(&environment)?;
+            if !profiles.profiles.contains_key(&profile) {
+                return Err(user_error(format!("unknown profile: {profile}")));
+            }
+            profiles.default = Some(profile.clone());
+            save_profiles(&environment, &profiles)?;
+            print_json_or(
+                json,
+                serde_json::json!({"profile":profile,"default":true}),
+                format!("default profile {profile}"),
+            );
+        }
+        ProfileCommand::Apply { profile, ledger } => {
+            let profiles = load_profiles(&environment)?;
+            let profile_name = match profile.or(profiles.default.clone()) {
+                Some(profile) => profile,
+                None => return Err(user_error("no profile named and no default profile is set")),
+            };
+            let value = profiles
+                .profiles
+                .get(&profile_name)
+                .cloned()
+                .ok_or_else(|| user_error(format!("unknown profile: {profile_name}")))?;
+            let ledgers = if ledger.is_empty() {
+                vec![selected_active_ledger_name(&environment)?]
+            } else {
+                ledger
+            };
+            let mut applied = Vec::new();
+            for ledger in ledgers {
+                let entry = ensure_active_entry(&environment, Some(&ledger))?;
+                let directory =
+                    apply_profile_to_entry(&environment, &entry, &profile_name, &value)?;
+                applied.push(serde_json::json!({
+                    "ledger":entry.name,
+                    "ledger_id":entry.ledger_id,
+                    "actor_id":directory.actor_id,
+                    "actor_ref":fact_sdk::reference::short_uuid_reference(directory.actor_id),
+                    "profile":profile_name
+                }));
+            }
+            print_json_or(
+                json,
+                serde_json::json!({"applied":applied}),
+                format!("applied profile {profile_name}"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn selected_active_ledger_name(
+    environment: &UserEnvironment,
+) -> Result<String, Box<dyn std::error::Error>> {
+    environment
+        .active_name()?
+        .ok_or_else(|| user_error("no active ledger; run `fact init`"))
+}
+
+fn validate_profile_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if fact_sdk::environment::valid_name(name) {
+        Ok(())
+    } else {
+        Err(user_error(format!("invalid profile name: {name}")))
+    }
+}
+
+fn apply_profile_to_entry(
+    environment: &UserEnvironment,
+    entry: &LedgerEntry,
+    profile_name: &str,
+    profile: &ActorProfile,
+) -> Result<fact_sdk::workflow::DirectoryAddResult, Box<dyn std::error::Error>> {
+    let seed = read_seed_for_write(environment, entry)?;
+    let actor_id = uuid::Uuid::parse_str(&entry.actor_id)?;
+    let key_id = uuid::Uuid::parse_str(&entry.key_id)?;
+    let result = fact_sdk::workflow::add_directory_entry(
+        entry,
+        &seed,
+        fact_sdk::workflow::DirectoryAddInput {
+            display_name: profile.display_name.clone(),
+            actor_id: Some(actor_id),
+            key_id: Some(key_id),
+            alias: profile.alias.clone(),
+            actor_type: Some(profile.actor_type.clone()),
+            role: profile.role.clone(),
+            source: Some(format!("profile:{profile_name}")),
+            verified_by: None,
+            with_identity: false,
+            seed: None,
+        },
+    )?;
+    Ok(result)
+}
+
+fn persona_path(environment: &UserEnvironment) -> PathBuf {
+    environment.root().join("personas.toml")
+}
+
+fn persona_database(environment: &UserEnvironment) -> PathBuf {
+    environment.identity_dir.join("personas.sqlite")
+}
+
+fn load_personas(environment: &UserEnvironment) -> Result<PersonaFile, Box<dyn std::error::Error>> {
+    match fs::read_to_string(persona_path(environment)) {
+        Ok(text) => Ok(toml::from_str(&text)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(PersonaFile::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_personas(
+    environment: &UserEnvironment,
+    personas: &PersonaFile,
+) -> Result<(), Box<dyn std::error::Error>> {
+    environment.ensure_dirs()?;
+    fs::write(persona_path(environment), toml::to_string_pretty(personas)?)?;
+    Ok(())
+}
+
+fn resolve_persona(
+    environment: &UserEnvironment,
+    reference: &str,
+) -> Result<(String, PersonaEntry), Box<dyn std::error::Error>> {
+    let personas = load_personas(environment)?;
+    if let Some(persona) = personas.personas.get(reference) {
+        return Ok((reference.to_owned(), persona.clone()));
+    }
+    let matches = personas
+        .personas
+        .iter()
+        .filter(|(_, persona)| {
+            persona.alias.as_deref() == Some(reference)
+                || persona.actor_id == reference
+                || uuid::Uuid::parse_str(&persona.actor_id)
+                    .ok()
+                    .map(fact_sdk::reference::short_uuid_reference)
+                    .as_deref()
+                    == Some(reference)
+        })
+        .map(|(name, persona)| (name.clone(), persona.clone()))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [(name, persona)] => Ok((name.clone(), persona.clone())),
+        [] => Err(user_error(format!("unknown persona: {reference}"))),
+        _ => Err(user_error(format!(
+            "ambiguous persona reference: {reference}"
+        ))),
+    }
+}
+
+fn default_persona(
+    environment: &UserEnvironment,
+) -> Result<Option<(String, PersonaEntry)>, Box<dyn std::error::Error>> {
+    let personas = load_personas(environment)?;
+    let Some(name) = personas.default else {
+        return Ok(None);
+    };
+    let persona = personas
+        .personas
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| user_error(format!("default persona is missing: {name}")))?;
+    Ok(Some((name, persona)))
+}
+
+fn persona_seed_file(environment: &UserEnvironment, persona: &PersonaEntry) -> PathBuf {
+    environment
+        .identity_dir
+        .join(format!("{}.seed", persona.actor_id))
+}
+
+fn persona_ledger_entry(
+    environment: &UserEnvironment,
+    name: &str,
+    persona: &PersonaEntry,
+) -> LedgerEntry {
+    LedgerEntry {
+        name: name.to_owned(),
+        ledger_id: persona.ledger_id.clone(),
+        database: persona_database(environment),
+        actor_id: persona.actor_id.clone(),
+        key_id: persona.key_id.clone(),
+        seed_file: persona_seed_file(environment, persona),
+        read_only: false,
+    }
+}
+
+fn persona_identity_bundle(
+    environment: &UserEnvironment,
+    name: &str,
+    persona: &PersonaEntry,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if let Some(bundle) = &persona.identity_bundle {
+        return decode_base64url(bundle)
+            .ok_or_else(|| user_error(format!("persona {name} has invalid identity bundle")));
+    }
+    let persona_entry = persona_ledger_entry(environment, name, persona);
+    Ok(fact_sdk::workflow::export_identity_for_actor(
+        &persona_entry,
+        uuid::Uuid::parse_str(&persona.actor_id)?,
+    )?
+    .bundle)
+}
+
+fn persona_for_actor(
+    environment: &UserEnvironment,
+    actor_id: &str,
+) -> Result<Option<(String, PersonaEntry)>, Box<dyn std::error::Error>> {
+    let personas = load_personas(environment)?;
+    Ok(personas
+        .personas
+        .into_iter()
+        .find(|(_, persona)| persona.actor_id == actor_id))
+}
+
+fn persona_json(
+    environment: &UserEnvironment,
+    name: &str,
+    persona: &PersonaEntry,
+    default: bool,
+) -> serde_json::Value {
+    let actor_id = uuid::Uuid::parse_str(&persona.actor_id).ok();
+    let key_id = uuid::Uuid::parse_str(&persona.key_id).ok();
+    serde_json::json!({
+        "persona":name,
+        "display_name":persona.display_name,
+        "alias":persona.alias,
+        "actor_type":persona.actor_type,
+        "ledger_id":persona.ledger_id,
+        "actor_id":persona.actor_id,
+        "actor_ref":actor_id.map(fact_sdk::reference::short_uuid_reference),
+        "key_id":persona.key_id,
+        "key_ref":key_id.map(fact_sdk::reference::short_uuid_reference),
+        "default":default,
+        "local_private_key_material":persona_seed_file(environment, persona).exists()
+    })
+}
+
+fn handle_persona_command(
+    json: bool,
+    command: PersonaCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let environment = UserEnvironment::discover()?;
+    match command {
+        PersonaCommand::Add {
+            persona,
+            name,
+            alias,
+            actor_type,
+            default,
+        } => {
+            validate_profile_name(&persona)?;
+            let mut personas = load_personas(&environment)?;
+            if personas.personas.contains_key(&persona) {
+                return Err(user_error(format!("persona already exists: {persona}")));
+            }
+            environment.ensure_dirs()?;
+            let runtime = fact_sdk::runtime::production_runtime();
+            let seed = runtime.seed()?;
+            let created = fact_sdk::workflow::create_identity_for_persona(
+                fact_sdk::workflow::CreatePersonaIdentityInput {
+                    namespace: format!("local.persona.{persona}"),
+                    seed,
+                    actor_type: actor_type.clone(),
+                },
+            )?;
+            let entry = PersonaEntry {
+                display_name: name,
+                alias,
+                actor_type,
+                ledger_id: created.ledger_id.to_string(),
+                actor_id: created.actor_id.to_string(),
+                key_id: created.key_id.to_string(),
+                identity_bundle: Some(encode_base64url(&created.bundle)),
+            };
+            environment.write_seed(&persona_seed_file(&environment, &entry), &created.seed)?;
+            personas.personas.insert(persona.clone(), entry.clone());
+            if default || personas.default.is_none() {
+                personas.default = Some(persona.clone());
+            }
+            save_personas(&environment, &personas)?;
+            print_json_or(
+                json,
+                persona_json(
+                    &environment,
+                    &persona,
+                    &entry,
+                    personas.default.as_deref() == Some(persona.as_str()),
+                ),
+                format!("added persona {persona}"),
+            );
+        }
+        PersonaCommand::List => {
+            let personas = load_personas(&environment)?;
+            let items = personas
+                .personas
+                .iter()
+                .map(|(name, persona)| {
+                    persona_json(
+                        &environment,
+                        name,
+                        persona,
+                        personas.default.as_deref() == Some(name.as_str()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if json {
+                println!("{}", serde_json::json!(items));
+            } else if items.is_empty() {
+                println!("no personas");
+            } else {
+                for item in items {
+                    println!(
+                        "{}  {}  {}{}{}",
+                        item["persona"].as_str().unwrap(),
+                        item["actor_ref"].as_str().unwrap_or("-"),
+                        item["display_name"].as_str().unwrap(),
+                        item["alias"]
+                            .as_str()
+                            .map(|alias| format!("  @{alias}"))
+                            .unwrap_or_default(),
+                        if item["default"].as_bool() == Some(true) {
+                            "  default"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+        }
+        PersonaCommand::Show { persona } => {
+            let (name, persona) = resolve_persona(&environment, &persona)?;
+            let personas = load_personas(&environment)?;
+            let is_default = personas.default.as_deref() == Some(name.as_str());
+            print_json_or(
+                json,
+                persona_json(&environment, &name, &persona, is_default),
+                format!(
+                    "{}  {}  {}{}{}",
+                    name,
+                    fact_sdk::reference::short_uuid_reference(uuid::Uuid::parse_str(
+                        &persona.actor_id
+                    )?),
+                    persona.display_name,
+                    persona
+                        .alias
+                        .as_ref()
+                        .map(|alias| format!("  @{alias}"))
+                        .unwrap_or_default(),
+                    if is_default { "  default" } else { "" }
+                ),
+            );
+        }
+        PersonaCommand::Default { persona } => {
+            let (name, _) = resolve_persona(&environment, &persona)?;
+            let mut personas = load_personas(&environment)?;
+            personas.default = Some(name.clone());
+            save_personas(&environment, &personas)?;
+            print_json_or(
+                json,
+                serde_json::json!({"persona":name,"default":true}),
+                format!("default persona {name}"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_user_ledger_with_persona(
+    environment: &UserEnvironment,
+    name: &str,
+    requested_persona: Option<&str>,
+) -> Result<(LedgerEntry, bool, Option<String>), Box<dyn std::error::Error>> {
+    if let Some(entry) = environment.load()?.get(name).cloned() {
+        let persona = persona_for_actor(environment, &entry.actor_id)?.map(|(name, _)| name);
+        return Ok((entry, false, persona));
+    }
+    let persona = match requested_persona {
+        Some(reference) => Some(resolve_persona(environment, reference)?),
+        None => default_persona(environment)?,
+    };
+    let (entry, created) = environment::ensure_user_ledger(environment, name)?;
+    let Some((persona_name, persona)) = persona else {
+        return Ok((entry, created, None));
+    };
+    if !created {
+        return Ok((entry, false, Some(persona_name)));
+    }
+    let persona_bundle = persona_identity_bundle(environment, &persona_name, &persona)?;
+    fact_sdk::workflow::import_identity(&entry, &persona_bundle)?;
+    let seed = read_seed_for_write(environment, &entry)?;
+    fact_sdk::workflow::create_identity_grant(
+        &entry,
+        &seed,
+        &persona.actor_id,
+        &["admin".to_owned()],
+    )?;
+    let mut entries = environment.load()?;
+    let mut updated = entry.clone();
+    updated.actor_id = persona.actor_id.clone();
+    updated.key_id = persona.key_id.clone();
+    updated.seed_file = persona_seed_file(environment, &persona);
+    entries.insert(name.to_owned(), updated.clone());
+    environment.save(&entries)?;
+    Ok((updated, true, Some(persona_name)))
+}
+
+fn directory_entries_by_actor(
+    entry: &LedgerEntry,
+) -> Result<
+    std::collections::BTreeMap<uuid::Uuid, fact_sdk::workflow::DirectoryEntry>,
+    Box<dyn std::error::Error>,
+> {
+    Ok(fact_sdk::workflow::list_directory(entry)?
+        .into_iter()
+        .map(|entry| (entry.actor_id, entry))
+        .collect())
+}
+
+fn ledger_proposition_counts(
+    items: &[PropositionListItem],
+) -> std::collections::BTreeMap<&'static str, usize> {
+    fn increment(counts: &mut std::collections::BTreeMap<&'static str, usize>, key: &'static str) {
+        counts.entry(key).and_modify(|count| *count += 1);
+    }
+
+    let mut counts = std::collections::BTreeMap::from([
+        ("total", items.len()),
+        ("accepted", 0),
+        ("pending", 0),
+        ("rejected", 0),
+        ("contested", 0),
+        ("withdrawn", 0),
+        ("archived", 0),
+        ("update_pending", 0),
+    ]);
+    for item in items {
+        match proposition_display_status(item).as_str() {
+            "accepted" => increment(&mut counts, "accepted"),
+            "pending" => increment(&mut counts, "pending"),
+            "rejected" => increment(&mut counts, "rejected"),
+            "contested" | "conflict" => increment(&mut counts, "contested"),
+            "withdrawn" => increment(&mut counts, "withdrawn"),
+            "archived" => increment(&mut counts, "archived"),
+            status if status.ends_with(", update pending") => {
+                increment(&mut counts, "update_pending");
+                match status.trim_end_matches(", update pending") {
+                    "accepted" => increment(&mut counts, "accepted"),
+                    "pending" => increment(&mut counts, "pending"),
+                    "rejected" => increment(&mut counts, "rejected"),
+                    "contested" | "conflict" => increment(&mut counts, "contested"),
+                    _ => {}
+                }
+            }
+            _ => {}
+        };
+    }
+    counts
+}
+
+fn ledger_show_value(
+    environment: &UserEnvironment,
+    entry: &LedgerEntry,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let propositions = list_user_propositions(entry, None, true, 0, 0, None)?;
+    let actors = actor_identity_list_items(environment, entry, 0, 0)?;
+    let remotes = environment.load_remotes()?;
+    let remote_count = scoped_remotes(remotes.values(), &entry.ledger_id).len();
+    let active = environment
+        .active_name()?
+        .as_deref()
+        .is_some_and(|active| active == entry.name);
+    Ok(serde_json::json!({
+        "name":entry.name,
+        "ledger_id":entry.ledger_id,
+        "ledger_ref":short_uuid_string(&entry.ledger_id),
+        "database":entry.database,
+        "read_only":entry.read_only,
+        "active":active,
+        "remote_count":remote_count,
+        "propositions":ledger_proposition_counts(&propositions),
+        "actors":actors
+    }))
+}
+
+fn format_ledger_proposition_counts(counts: &serde_json::Value) -> String {
+    format!(
+        "{} total, {} accepted, {} pending, {} rejected, {} contested, {} withdrawn, {} archived, {} update pending",
+        counts["total"].as_u64().unwrap_or_default(),
+        counts["accepted"].as_u64().unwrap_or_default(),
+        counts["pending"].as_u64().unwrap_or_default(),
+        counts["rejected"].as_u64().unwrap_or_default(),
+        counts["contested"].as_u64().unwrap_or_default(),
+        counts["withdrawn"].as_u64().unwrap_or_default(),
+        counts["archived"].as_u64().unwrap_or_default(),
+        counts["update_pending"].as_u64().unwrap_or_default()
+    )
+}
+
+fn print_ledger_show(
+    json: bool,
+    value: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(value)?);
+        return Ok(());
+    }
+
+    println!(
+        "ledger        {}  {}",
+        value["name"].as_str().unwrap_or("-"),
+        value["ledger_ref"].as_str().unwrap_or("-")
+    );
+    println!(
+        "database      {}",
+        value["database"].as_str().unwrap_or("-")
+    );
+    println!(
+        "read only     {}",
+        value["read_only"].as_bool().unwrap_or_default()
+    );
+    println!(
+        "active        {}",
+        value["active"].as_bool().unwrap_or_default()
+    );
+    println!(
+        "remotes       {}",
+        value["remote_count"].as_u64().unwrap_or_default()
+    );
+    println!(
+        "propositions  {}",
+        format_ledger_proposition_counts(&value["propositions"])
+    );
+    println!("actors");
+    let actors = value["actors"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    print_actor_identity_items(false, actors)?;
+    Ok(())
+}
+
+fn actor_identity_list_items(
+    environment: &UserEnvironment,
+    entry: &LedgerEntry,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let store = fact_store::Store::open(&entry.database)?;
+    let directory_entries = directory_entries_by_actor(entry)?;
+    let mut items = Vec::new();
+    for (id, _, object_type) in store.list_identity_objects()? {
+        if object_type != "actor" {
+            continue;
+        }
+        let local_seed = environment.identity_dir.join(format!("{id}.seed")).exists();
+        let key_id = identity_actor_key_id(&store, id)?;
+        let directory = directory_entries.get(&id);
+        let capabilities = actor_capabilities_in_store(&store, entry, id)?;
+        let persona = persona_for_actor(environment, &id.to_string())?;
+        let admin = capabilities.iter().any(|capability| capability == "admin");
+        items.push(serde_json::json!({
+            "actor_id":id,
+            "actor_ref":fact_sdk::reference::short_uuid_reference(id),
+            "key_id":key_id,
+            "key_ref":key_id.map(fact_sdk::reference::short_uuid_reference),
+            "persona":persona.as_ref().map(|(name, _)| name.clone()),
+            "display_name":directory.as_ref().map(|item| item.display_name.clone()),
+            "alias":directory.as_ref().and_then(|item| item.alias.clone()),
+            "capabilities":capabilities,
+            "admin":admin,
+            "local_private_key_material":local_seed,
+            "active":entry.actor_id == id.to_string()
+        }));
+    }
+    Ok(items
+        .into_iter()
+        .skip(offset)
+        .take(if limit == 0 { usize::MAX } else { limit })
+        .collect())
+}
+
+fn print_actor_identity_items(
+    json: bool,
+    items: &[serde_json::Value],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(items)?);
+    } else if items.is_empty() {
+        println!("no actors");
+    } else {
+        for item in items {
+            let name = item["display_name"].as_str().unwrap_or("No name");
+            let key = item["key_ref"].as_str().unwrap_or("-");
+            let alias = item["alias"].as_str().unwrap_or("No alias");
+            let active = if item["active"].as_bool() == Some(true) {
+                "  active"
+            } else {
+                ""
+            };
+            let capabilities = item["capabilities"]
+                .as_array()
+                .map(|capabilities| {
+                    capabilities
+                        .iter()
+                        .filter_map(|capability| capability.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|capabilities| !capabilities.is_empty())
+                .map(|capabilities| format!("  {capabilities}"))
+                .unwrap_or_default();
+            println!(
+                "{}  {}  {}  {}{}{}",
+                item["actor_ref"].as_str().unwrap(),
+                key,
+                name,
+                alias,
+                capabilities,
+                active
+            );
+        }
+    }
+    Ok(())
+}
+
+fn actor_identity_show_value(
+    environment: &UserEnvironment,
+    entry: &LedgerEntry,
+    actor: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let actor_id = fact_sdk::workflow::resolve_directory_actor_reference(entry, actor)?;
+    let store = fact_store::Store::open(&entry.database)?;
+    let local_seed = environment
+        .identity_dir
+        .join(format!("{actor_id}.seed"))
+        .exists();
+    let directory_entries = directory_entries_by_actor(entry)?;
+    let directory = directory_entries.get(&actor_id);
+    let capabilities = actor_capabilities_in_store(&store, entry, actor_id)?;
+    let key_id = identity_actor_key_id(&store, actor_id)?;
+    let persona = persona_for_actor(environment, &actor_id.to_string())?;
+    Ok(serde_json::json!({
+        "actor_id":actor_id,
+        "actor_ref":fact_sdk::reference::short_uuid_reference(actor_id),
+        "key_id":key_id,
+        "key_ref":key_id.map(fact_sdk::reference::short_uuid_reference),
+        "persona":persona.as_ref().map(|(name, _)| name.clone()),
+        "display_name":directory.as_ref().map(|item| item.display_name.clone()),
+        "alias":directory.as_ref().and_then(|item| item.alias.clone()),
+        "capabilities":capabilities,
+        "local_private_key_material":local_seed,
+        "active":entry.actor_id == actor_id.to_string(),
+        "imported":store.get_cose_by_id_any(actor_id.as_bytes())?.is_some()
+    }))
+}
+
+fn print_actor_identity_show(
+    json: bool,
+    value: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let capabilities = value["capabilities"]
+        .as_array()
+        .map(|capabilities| {
+            capabilities
+                .iter()
+                .filter_map(|capability| capability.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|capabilities| !capabilities.is_empty())
+        .unwrap_or_else(|| "none".to_owned());
+    print_json_or(
+        json,
+        value.clone(),
+        format!(
+            "{}  {}\nkey: {}\npersona: {}\ncapabilities: {}",
+            value["actor_ref"].as_str().unwrap_or("-"),
+            value["display_name"].as_str().unwrap_or("unnamed"),
+            value["key_ref"].as_str().unwrap_or("-"),
+            value["persona"].as_str().unwrap_or("-"),
+            capabilities
+        ),
+    );
+    Ok(())
+}
+
+fn use_actor_identity(
+    environment: &UserEnvironment,
+    entry: LedgerEntry,
+    actor: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let requested_name = entry.name.clone();
+    let mut entries = environment.load()?;
+    let resolved = fact_sdk::workflow::resolve_directory_reference(&entry, actor)?;
+    let store = fact_store::Store::open(&entry.database)?;
+    let key_id = resolved
+        .key_id
+        .or(identity_actor_key_id(&store, resolved.actor_id)?)
+        .ok_or_else(|| {
+            user_error(format!(
+                "actor {} has no signing key association",
+                resolved.actor_id
+            ))
+        })?;
+    let seed_file = local_identity_seed_file(environment, resolved.actor_id, key_id)?;
+    let updated = LedgerEntry {
+        actor_id: resolved.actor_id.to_string(),
+        key_id: key_id.to_string(),
+        seed_file,
+        ..entry
+    };
+    entries.insert(requested_name.clone(), updated);
+    environment.save(&entries)?;
+    Ok(serde_json::json!({
+        "active":true,
+        "ledger":requested_name,
+        "actor_id":resolved.actor_id,
+        "key_id":key_id,
+        "display_name":resolved.display_name
+    }))
+}
+
+fn name_actor_identity(
+    environment: &UserEnvironment,
+    entry: &LedgerEntry,
+    actor: &str,
+    display_name: String,
+    alias: Option<String>,
+    actor_type: Option<String>,
+    role: Option<String>,
+) -> Result<fact_sdk::workflow::DirectoryAddResult, Box<dyn std::error::Error>> {
+    let seed = read_seed_for_write(environment, entry)?;
+    let actor_id = fact_sdk::workflow::resolve_directory_actor_reference(entry, actor)?;
+    let store = fact_store::Store::open(&entry.database)?;
+    let current = fact_sdk::workflow::show_directory_entry(entry, &actor_id.to_string()).ok();
+    let key_id = current
+        .as_ref()
+        .and_then(|entry| entry.key_id)
+        .or(identity_actor_key_id(&store, actor_id)?);
+    fact_sdk::workflow::add_directory_entry(
+        entry,
+        &seed,
+        fact_sdk::workflow::DirectoryAddInput {
+            display_name,
+            actor_id: Some(actor_id),
+            key_id,
+            alias: alias.or_else(|| current.as_ref().and_then(|entry| entry.alias.clone())),
+            actor_type: actor_type
+                .or_else(|| current.as_ref().and_then(|entry| entry.actor_type.clone())),
+            role: role.or_else(|| current.as_ref().and_then(|entry| entry.role.clone())),
+            source: Some("actor-name".to_owned()),
+            verified_by: None,
+            with_identity: false,
+            seed: None,
+        },
+    )
+    .map_err(Into::into)
+}
+
+fn handle_actor_command(
+    json: bool,
+    command: ActorCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        ActorCommand::New {
+            name,
+            alias,
+            profile,
+            actor_type,
+            role,
+            permission,
+            participate,
+            ledger,
+        } => {
+            let value = as_user_identity(fact_as::Input {
+                name,
+                alias,
+                self_actor: false,
+                actor_type,
+                profile,
+                role,
+                source: None,
+                verified_by: None,
+                home: None,
+                print_env: false,
+                use_home: false,
+                permission,
+                participate,
+                no_create: false,
+                update_directory: false,
+                ledger,
+            })?;
+            print_json_or(
+                json,
+                value.clone(),
+                format!(
+                    "using {} for ledger {}",
+                    value["actor"]["display_name"].as_str().unwrap_or("actor"),
+                    value["ledger"]["name"].as_str().unwrap_or("-")
+                ),
+            );
+        }
+        ActorCommand::List {
+            limit,
+            offset,
+            ledger,
+        } => {
+            let environment = UserEnvironment::discover()?;
+            let entry = ensure_active_entry(&environment, ledger.as_deref())?;
+            let items = actor_identity_list_items(&environment, &entry, limit, offset)?;
+            print_actor_identity_items(json, &items)?;
+        }
+        ActorCommand::Show { actor, ledger } => {
+            let environment = UserEnvironment::discover()?;
+            let entry = ensure_active_entry(&environment, ledger.as_deref())?;
+            let value = actor_identity_show_value(&environment, &entry, &actor)?;
+            print_actor_identity_show(json, value)?;
+        }
+        ActorCommand::Use { actor, ledger } => {
+            let environment = UserEnvironment::discover()?;
+            let entry = ensure_active_entry(&environment, ledger.as_deref())?;
+            let value = use_actor_identity(&environment, entry, &actor)?;
+            print_json_or(
+                json,
+                value.clone(),
+                format!(
+                    "using {} for ledger {}",
+                    value["display_name"].as_str().unwrap_or("actor"),
+                    value["ledger"].as_str().unwrap_or("-")
+                ),
+            );
+        }
+        ActorCommand::Name {
+            actor,
+            name,
+            alias,
+            actor_type,
+            role,
+            ledger,
+        } => {
+            let environment = UserEnvironment::discover()?;
+            let entry = ensure_active_entry(&environment, ledger.as_deref())?;
+            let result =
+                name_actor_identity(&environment, &entry, &actor, name, alias, actor_type, role)?;
+            print_json_or(
+                json,
+                serde_json::to_value(&result)?,
+                format!("named {} as {}", result.display_name, result.actor_ref),
+            );
+        }
+        ActorCommand::Grant {
+            actor,
+            capabilities,
+            participate,
+            ledger,
+        } => {
+            let environment = UserEnvironment::discover()?;
+            let entry = ensure_active_entry(&environment, ledger.as_deref())?;
+            let capabilities = expanded_capabilities(capabilities, participate)?;
+            let value = recognize_user_identity(
+                &entry,
+                &read_seed_for_write(&environment, &entry)?,
+                &actor,
+                &capabilities,
+            )?;
+            print_json_or(
+                json,
+                value.clone(),
+                format!("granted {} to {}", value["capabilities"], value["actor_id"]),
+            );
+        }
+        ActorCommand::Revoke {
+            grant,
+            reason,
+            ledger,
+        } => {
+            let environment = UserEnvironment::discover()?;
+            let entry = ensure_active_entry(&environment, ledger.as_deref())?;
+            let value = revoke_user_grant(
+                &entry,
+                &read_seed_for_write(&environment, &entry)?,
+                &grant,
+                reason
+                    .as_deref()
+                    .unwrap_or("authority revoked by ledger administrator"),
+            )?;
+            print_json_or(
+                json,
+                value.clone(),
+                format!("revoked grant {}", value["revoked_grant_id"]),
+            );
+        }
+        ActorCommand::Send {
+            name,
+            alias,
+            profile,
+            actor_type,
+            requests,
+            participate,
+            output,
+        } => {
+            let environment = UserEnvironment::discover()?;
+            let profile = profile
+                .as_deref()
+                .map(|name| {
+                    named_profile(&environment, name).map(|profile| (name.to_owned(), profile))
+                })
+                .transpose()?;
+            let name = name
+                .or_else(|| {
+                    profile
+                        .as_ref()
+                        .map(|(_, profile)| profile.display_name.clone())
+                })
+                .ok_or_else(|| user_error("fact actor send requires a name or --profile"))?;
+            let alias = alias.or_else(|| {
+                profile
+                    .as_ref()
+                    .and_then(|(_, profile)| profile.alias.clone())
+            });
+            let actor_type = actor_type
+                .or_else(|| {
+                    profile
+                        .as_ref()
+                        .map(|(_, profile)| profile.actor_type.clone())
+                })
+                .unwrap_or_else(|| "human".to_owned());
+            let actor =
+                ensure_actor_request_identity(&environment, &name, alias.as_deref(), &actor_type)?;
+            let entry = actor_request_ledger_entry(&actor);
+            let bundle = fact_sdk::workflow::export_identity_for_actor(
+                &entry,
+                uuid::Uuid::parse_str(&actor.actor_id)?,
+            )?
+            .bundle;
+            let identity =
+                identity_from_actor_bundle(&bundle, uuid::Uuid::parse_str(&actor.actor_id)?)?;
+            let requests = expanded_actor_requests(requests, participate)?;
+            let request = actor_exchange::encode_actor_request(
+                identity.actor_id,
+                actor_exchange::ActorClaims {
+                    display_name: Some(actor.name.clone()),
+                    alias: actor.alias.clone(),
+                    actor_type: Some(actor.actor_type.clone()),
+                },
+                requests,
+                &bundle,
+            );
+            let bytes = actor_exchange::request_json(&request, false)?;
+            let output = output
+                .unwrap_or_else(|| actor_request_default_file(&actor.name, actor.alias.as_deref()));
+            write_actor_artifact(&output, &bytes, false)?;
+            let value = serde_json::json!({
+                "created":true,
+                "actor_id":identity.actor_id,
+                "actor_ref":fact_sdk::reference::short_uuid_reference(identity.actor_id),
+                "key_id":identity.key_id,
+                "key_ref":fact_sdk::reference::short_uuid_reference(identity.key_id),
+                "fingerprint":identity.fingerprint,
+                "claims":request.claims,
+                "requests":request.requests,
+                "output":output
+            });
+            print_json_or(
+                json,
+                value,
+                format!(
+                    "wrote {}\nactor      {}\nclaims     {}\nrequests   {}\nkey        {}",
+                    output.display(),
+                    fact_sdk::reference::short_uuid_reference(identity.actor_id),
+                    format_actor_claims(&request.claims),
+                    format_capability_list(&request.requests),
+                    identity.fingerprint
+                ),
+            );
+        }
+        ActorCommand::Inspect { file } => {
+            let review = read_actor_request_review(&file)?;
+            let value = actor_request_review_json(&review);
+            print_json_or(json, value, format_actor_request_review(&review));
+        }
+        ActorCommand::Admit {
+            file,
+            input,
+            name,
+            alias,
+            actor_type,
+            capabilities,
+            participate,
+            with_token,
+            token_expires_days,
+            token_label,
+            token_store,
+            output,
+            ledger,
+            remote,
+        } => {
+            let request_path = input.or(file).ok_or_else(|| {
+                user_error(
+                    "fact actor admit requires FILE or --input FILE; use --input - for stdin",
+                )
+            })?;
+            let review = read_actor_request_review(&request_path)?;
+            let capabilities = expanded_capabilities(capabilities, participate)?;
+            let environment = UserEnvironment::discover()?;
+            let entry = ensure_active_entry(&environment, ledger.as_deref())?;
+            let remote = configured_remote_for_ledger(&environment, remote.as_deref(), &entry)?;
+            let store = fact_store::Store::open(&entry.database)?;
+            let ledger_id = uuid::Uuid::parse_str(&entry.ledger_id)?;
+            let (namespace, genesis_hash) = store
+                .get_ledger_metadata(ledger_id.as_bytes())?
+                .ok_or_else(|| {
+                    user_error(format!(
+                        "ledger metadata is missing for {}",
+                        entry.ledger_id
+                    ))
+                })?;
+            let genesis_hash = genesis_hash.ok_or_else(|| {
+                user_error(format!(
+                    "ledger genesis hash is missing for {}; cannot write a remote descriptor",
+                    entry.ledger_id
+                ))
+            })?;
+            let claims = &review.request.claims;
+            let display_name = name
+                .or_else(|| claims.display_name.clone())
+                .unwrap_or_else(|| review.identity.actor_id.to_string());
+            let alias = alias.or_else(|| claims.alias.clone());
+            let actor_type = actor_type
+                .or_else(|| claims.actor_type.clone())
+                .or_else(|| Some("human".to_owned()));
+            let seed = read_seed_for_write(&environment, &entry)?;
+            let imported = fact_sdk::workflow::import_identity(&entry, &review.bundle)?;
+            let directory = fact_sdk::workflow::add_directory_entry(
+                &entry,
+                &seed,
+                fact_sdk::workflow::DirectoryAddInput {
+                    display_name: display_name.clone(),
+                    actor_id: Some(review.identity.actor_id),
+                    key_id: Some(review.identity.key_id),
+                    alias: alias.clone(),
+                    actor_type: actor_type.clone(),
+                    role: None,
+                    source: Some("actor-admit".to_owned()),
+                    verified_by: None,
+                    with_identity: false,
+                    seed: None,
+                },
+            )?;
+            let grant = fact_sdk::workflow::create_identity_grant(
+                &entry,
+                &seed,
+                &review.identity.actor_id.to_string(),
+                &capabilities,
+            )?;
+            let issued_token = if with_token {
+                Some(issue_http_actor_token(
+                    &environment,
+                    &entry,
+                    review.identity.actor_id,
+                    token_expires_days,
+                    token_label
+                        .or_else(|| alias.clone())
+                        .or_else(|| Some(display_name.clone())),
+                    token_store,
+                )?)
+            } else {
+                None
+            };
+            let grant_id = uuid::Uuid::parse_str(&grant.grant_id.to_string())?;
+            let grant_bytes = store
+                .get_cose_by_id(ledger_id.as_bytes(), grant_id.as_bytes())?
+                .ok_or_else(|| {
+                    user_error(format!(
+                        "created grant object is missing: {}",
+                        grant.grant_id
+                    ))
+                })?;
+            let grant_hash = fact_core::Hash::from_str(&grant.content_hash)?;
+            let grant_bundle =
+                fact_sdk::workflow::encode_bundle(ledger_id, &[(grant_hash, grant_bytes)])?;
+            let response = actor_exchange::encode_actor_response(
+                review.identity.actor_id,
+                Some(actor_exchange::ActorClaims {
+                    display_name: Some(display_name.clone()),
+                    alias: alias.clone(),
+                    actor_type: actor_type.clone(),
+                }),
+                actor_exchange::ResponseLedger {
+                    id: ledger_id,
+                    genesis_hash: genesis_hash.hex(),
+                    namespace,
+                },
+                capabilities.clone(),
+                actor_exchange::ResponseEndpoint {
+                    schema: "fact-remote-v0".to_owned(),
+                    url: remote.url,
+                    ledger_id: entry.ledger_id.clone(),
+                    genesis_hash: genesis_hash.hex(),
+                    token: issued_token
+                        .as_ref()
+                        .map(|token| token.issued.token.clone()),
+                },
+                request_fingerprint(&review.bundle),
+                &grant_bundle,
+            );
+            let response_bytes = actor_exchange::response_json(&response, false)?;
+            let output = output
+                .unwrap_or_else(|| actor_response_default_file(alias.as_deref(), &display_name));
+            write_actor_artifact(&output, &response_bytes, response.endpoint.token.is_some())?;
+            let mut value = serde_json::json!({
+                "admitted":true,
+                "actor_id":review.identity.actor_id,
+                "actor_ref":fact_sdk::reference::short_uuid_reference(review.identity.actor_id),
+                "directory":directory,
+                "identity_import":imported,
+                "grant":grant,
+                "granted":capabilities,
+                "fingerprint":review.identity.fingerprint,
+                "response":response,
+                "output":output
+            });
+            if let Some(token) = &issued_token {
+                value["access_token"] = access_token_json(token, false);
+            }
+            let mut human = format_actor_request_review(&review);
+            human.push('\n');
+            human.push_str(&format!(
+                "recognized {} as {}\ngranted {}\nwrote {}",
+                fact_sdk::reference::short_uuid_reference(review.identity.actor_id),
+                format_actor_claims(&actor_exchange::ActorClaims {
+                    display_name: Some(display_name),
+                    alias,
+                    actor_type,
+                }),
+                format_capability_list(&capabilities),
+                output.display()
+            ));
+            print_json_or(json, value, human);
+        }
+    }
+    Ok(())
+}
+
+fn actor_registry_path(environment: &UserEnvironment) -> PathBuf {
+    environment.identity_dir.join("actors.json")
+}
+
+fn actor_request_database(environment: &UserEnvironment) -> PathBuf {
+    environment.identity_dir.join("actors.sqlite")
+}
+
+fn load_actor_registry(
+    environment: &UserEnvironment,
+) -> Result<ActorRegistry, Box<dyn std::error::Error>> {
+    let path = actor_registry_path(environment);
+    match fs::read(&path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ActorRegistry::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_actor_registry(
+    environment: &UserEnvironment,
+    registry: &ActorRegistry,
+) -> Result<(), Box<dyn std::error::Error>> {
+    environment.ensure_dirs()?;
+    fs::write(
+        actor_registry_path(environment),
+        serde_json::to_vec_pretty(registry)?,
+    )?;
+    Ok(())
+}
+
+fn ensure_actor_request_identity(
+    environment: &UserEnvironment,
+    name: &str,
+    alias: Option<&str>,
+    actor_type: &str,
+) -> Result<ActorRequestIdentity, Box<dyn std::error::Error>> {
+    environment.ensure_dirs()?;
+    if let Some(identity) = directory_actor_request_identity(environment, name, alias)? {
+        return Ok(identity);
+    }
+    let key = actor_registry_key(name, alias)?;
+    let mut registry = load_actor_registry(environment)?;
+    if let Some(existing) = registry.actors.get(&key) {
+        let seed_file = environment
+            .identity_dir
+            .join(format!("{}.seed", existing.actor_id));
+        if seed_file.exists() {
+            let mut updated = existing.clone();
+            updated.name = name.to_owned();
+            updated.alias = alias.map(str::to_owned).or(existing.alias.clone());
+            updated.actor_type = actor_type.to_owned();
+            registry.actors.insert(key, updated.clone());
+            save_actor_registry(environment, &registry)?;
+            return Ok(registry_actor_request_identity(environment, updated));
+        }
+    }
+    let runtime = fact_sdk::runtime::production_runtime();
+    let seed = runtime.seed()?;
+    let database = actor_request_database(environment);
+    let store = fact_store::Store::open(&database)?;
+    let result = fact_sdk::workflow::create_identity(
+        &store,
+        fact_sdk::workflow::CreateIdentityInput {
+            namespace: format!("local.actor.{key}"),
+            seed,
+            actor_type: actor_type.to_owned(),
+        },
+    )?;
+    let seed_file = environment
+        .identity_dir
+        .join(format!("{}.seed", result.actor_id));
+    environment.write_seed(&seed_file, &seed)?;
+    let entry = ActorRegistryEntry {
+        name: name.to_owned(),
+        alias: alias.map(str::to_owned),
+        actor_type: actor_type.to_owned(),
+        ledger_id: result.ledger_id.to_string(),
+        actor_id: result.actor_id.to_string(),
+        key_id: result.key_id.to_string(),
+    };
+    registry.actors.insert(key, entry.clone());
+    save_actor_registry(environment, &registry)?;
+    Ok(registry_actor_request_identity(environment, entry))
+}
+
+fn actor_request_ledger_entry(actor: &ActorRequestIdentity) -> LedgerEntry {
+    LedgerEntry {
+        name: actor_registry_key(&actor.name, actor.alias.as_deref())
+            .unwrap_or_else(|_| "actor".to_owned()),
+        ledger_id: actor.ledger_id.clone(),
+        database: actor.database.clone(),
+        actor_id: actor.actor_id.clone(),
+        key_id: actor.key_id.clone(),
+        seed_file: actor.seed_file.clone(),
+        read_only: false,
+    }
+}
+
+fn registry_actor_request_identity(
+    environment: &UserEnvironment,
+    actor: ActorRegistryEntry,
+) -> ActorRequestIdentity {
+    ActorRequestIdentity {
+        name: actor.name,
+        alias: actor.alias,
+        actor_type: actor.actor_type,
+        ledger_id: actor.ledger_id,
+        database: actor_request_database(environment),
+        actor_id: actor.actor_id.clone(),
+        key_id: actor.key_id,
+        seed_file: environment
+            .identity_dir
+            .join(format!("{}.seed", actor.actor_id)),
+    }
+}
+
+fn directory_actor_request_identity(
+    environment: &UserEnvironment,
+    name: &str,
+    alias: Option<&str>,
+) -> Result<Option<ActorRequestIdentity>, Box<dyn std::error::Error>> {
+    let Ok(entry) = environment.resolve(None) else {
+        return Ok(None);
+    };
+    let directory = alias
+        .map(|alias| fact_sdk::workflow::show_directory_entry(&entry, alias))
+        .transpose()?
+        .or_else(|| fact_sdk::workflow::show_directory_entry(&entry, name).ok());
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    let Some(key_id) = directory.key_id else {
+        return Ok(None);
+    };
+    let seed_file = environment
+        .identity_dir
+        .join(format!("{}.seed", directory.actor_id));
+    if !seed_file.exists() {
+        return Ok(None);
+    }
+    Ok(Some(ActorRequestIdentity {
+        name: directory.display_name,
+        alias: directory.alias,
+        actor_type: directory.actor_type.unwrap_or_else(|| "human".to_owned()),
+        ledger_id: entry.ledger_id,
+        database: entry.database,
+        actor_id: directory.actor_id.to_string(),
+        key_id: key_id.to_string(),
+        seed_file,
+    }))
+}
+
+fn actor_registry_key(
+    name: &str,
+    alias: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let source = alias.unwrap_or(name);
+    let key = actor_artifact_stem(source);
+    if !portable_name(&key) {
+        return Err(user_error(format!("invalid actor name: {source}")));
+    }
+    Ok(key)
+}
+
+fn actor_artifact_stem(value: &str) -> String {
+    let mut output = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            output.push((byte as char).to_ascii_lowercase());
+        } else if matches!(byte, b'-' | b'_') {
+            output.push(byte as char);
+        } else if !output.ends_with('-') {
+            output.push('-');
+        }
+    }
+    output.trim_matches('-').to_owned()
+}
+
+fn actor_request_default_file(name: &str, alias: Option<&str>) -> PathBuf {
+    PathBuf::from(format!(
+        "{}.actor.json",
+        actor_artifact_stem(alias.unwrap_or(name))
+    ))
+}
+
+fn actor_response_default_file(alias: Option<&str>, display_name: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "{}.connection.json",
+        actor_artifact_stem(alias.unwrap_or(display_name))
+    ))
+}
+
+fn expanded_actor_requests(
+    requests: Vec<String>,
+    participate: bool,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut expanded = Vec::new();
+    let mut expand_participate = participate;
+    for request in requests {
+        if request == "participate" {
+            expand_participate = true;
+        } else {
+            expanded.push(request);
+        }
+    }
+    let expanded = expanded_optional_capabilities(expanded, expand_participate);
+    validate_capabilities(&expanded)?;
+    Ok(expanded)
+}
+
+fn read_actor_request_review(
+    path: &Path,
+) -> Result<ActorRequestReview, Box<dyn std::error::Error>> {
+    let bytes = read_actor_artifact(path)?;
+    let request = actor_exchange::parse_request(&bytes).map_err(user_error)?;
+    let bundle = actor_exchange::request_bundle(&request).map_err(user_error)?;
+    let identity = identity_from_actor_bundle(&bundle, request.actor)?;
+    let filename_mismatch = filename_actor_mismatch(path, request.actor);
+    Ok(ActorRequestReview {
+        request,
+        bundle,
+        identity,
+        filename_mismatch,
+    })
+}
+
+fn read_actor_artifact(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if path == Path::new("-") {
+        let mut bytes = Vec::new();
+        io::stdin().read_to_end(&mut bytes)?;
+        Ok(bytes)
+    } else {
+        Ok(fs::read(path)?)
+    }
+}
+
+fn write_actor_artifact(
+    path: &Path,
+    bytes: &[u8],
+    sensitive: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if path == Path::new("-") {
+        io::stdout().write_all(bytes)?;
+        return Ok(());
+    }
+    if sensitive {
+        write_file_with_mode(path, bytes, 0o600)?;
+    } else {
+        fs::write(path, bytes)?;
+    }
+    Ok(())
+}
+
+fn identity_from_actor_bundle(
+    bundle: &[u8],
+    actor_id: uuid::Uuid,
+) -> Result<ActorBundleIdentity, Box<dyn std::error::Error>> {
+    let bundle =
+        fact_commitment::decode_bundle(bundle).map_err(|error| user_error(error.to_string()))?;
+    let mut actor_seen = false;
+    let mut binding_key = None;
+    let mut keys = std::collections::BTreeMap::<uuid::Uuid, String>::new();
+    for object in bundle.objects {
+        let payload = fact_crypto::decode_sign1(&object)?.payload;
+        let value: serde_json::Value = serde_json::from_slice(&payload)?;
+        match value.get("object_type").and_then(serde_json::Value::as_str) {
+            Some("actor") => {
+                if value
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                    == Some(actor_id)
+                {
+                    actor_seen = true;
+                }
+            }
+            Some("actor_key_binding") => {
+                let body = value.get("body").and_then(serde_json::Value::as_object);
+                if body
+                    .and_then(|body| body.get("actor_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                    == Some(actor_id)
+                {
+                    binding_key = body
+                        .and_then(|body| body.get("key_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|value| uuid::Uuid::parse_str(value).ok());
+                }
+            }
+            Some("key") => {
+                let Some(key_id) = value
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                else {
+                    continue;
+                };
+                let Some(fingerprint) = value
+                    .get("body")
+                    .and_then(|body| body.get("public_key"))
+                    .and_then(|key| key.get("fingerprint"))
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                keys.insert(key_id, format!("SHA256:{fingerprint}"));
+            }
+            _ => {}
+        }
+    }
+    if !actor_seen {
+        return Err(user_error(format!(
+            "request bundle does not contain signed actor {actor_id}"
+        )));
+    }
+    let key_id = binding_key.ok_or_else(|| {
+        user_error(format!(
+            "request bundle does not contain a signing key binding for {actor_id}"
+        ))
+    })?;
+    let fingerprint = keys.get(&key_id).cloned().ok_or_else(|| {
+        user_error(format!(
+            "request bundle does not contain signing key {key_id}"
+        ))
+    })?;
+    Ok(ActorBundleIdentity {
+        actor_id,
+        key_id,
+        fingerprint,
+    })
+}
+
+fn filename_actor_mismatch(path: &Path, actor_id: uuid::Uuid) -> Option<String> {
+    if path == Path::new("-") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let candidate = uuid::Uuid::parse_str(stem).ok()?;
+    (candidate != actor_id).then(|| {
+        format!(
+            "filename actor {candidate} does not match bundle actor {actor_id}; using bundle actor"
+        )
+    })
+}
+
+fn actor_request_review_json(review: &ActorRequestReview) -> serde_json::Value {
+    serde_json::json!({
+        "actor_id":review.identity.actor_id,
+        "actor_ref":fact_sdk::reference::short_uuid_reference(review.identity.actor_id),
+        "key_id":review.identity.key_id,
+        "key_ref":fact_sdk::reference::short_uuid_reference(review.identity.key_id),
+        "fingerprint":review.identity.fingerprint,
+        "claims":review.request.claims,
+        "requests":review.request.requests,
+        "filename_mismatch":review.filename_mismatch
+    })
+}
+
+fn format_actor_request_review(review: &ActorRequestReview) -> String {
+    let mut lines = vec![
+        format!(
+            "actor      {}",
+            fact_sdk::reference::short_uuid_reference(review.identity.actor_id)
+        ),
+        format!("claims     {}", format_actor_claims(&review.request.claims)),
+        format!(
+            "requests   {}",
+            format_capability_list(&review.request.requests)
+        ),
+        format!("key        {}", review.identity.fingerprint),
+    ];
+    if let Some(mismatch) = &review.filename_mismatch {
+        lines.push(format!("warning    {mismatch}"));
+    }
+    lines.join("\n")
+}
+
+fn format_actor_claims(claims: &actor_exchange::ActorClaims) -> String {
+    let name = claims.display_name.as_deref().unwrap_or("unnamed");
+    let alias = claims
+        .alias
+        .as_ref()
+        .map(|alias| format!("  @{alias}"))
+        .unwrap_or_default();
+    let actor_type = claims.actor_type.as_deref().unwrap_or("unknown");
+    format!("\"{name}\"{alias}  ({actor_type})")
+}
+
+fn format_capability_list(capabilities: &[String]) -> String {
+    if capabilities.is_empty() {
+        "-".to_owned()
+    } else {
+        capabilities.join(", ")
+    }
+}
+
+fn request_fingerprint(bundle: &[u8]) -> String {
+    fact_core::Hash::digest(bundle).hex()
 }
 
 fn token_record_json(record: &fact_http::BearerTokenRecord) -> serde_json::Value {
@@ -5890,6 +8691,38 @@ fn format_actor_reference_value(value: &serde_json::Value) -> String {
     }
 }
 
+fn format_identity_import_result(
+    result: &fact_sdk::workflow::ImportIdentityResult,
+    directory: Option<&fact_sdk::workflow::ImportDirectoryResult>,
+) -> String {
+    let mut lines = vec![format!(
+        "imported {} identity object(s); recognition and authority remain separate",
+        result.imported
+    )];
+    if let Some(directory) = directory {
+        lines.push(format!(
+            "imported {} directory event(s), skipped {} ({} unresolved)",
+            directory.imported, directory.skipped, directory.skipped_unresolved
+        ));
+    }
+    if !result.actors.is_empty() {
+        lines.push("actors:".to_owned());
+        for actor in &result.actors {
+            let status = if actor.already_present {
+                "already present"
+            } else {
+                "newly imported"
+            };
+            let actor_label = match actor.display_name.as_deref() {
+                Some(name) => format!("{} ({})", actor.actor_ref, name),
+                None => actor.actor_ref.clone(),
+            };
+            lines.push(format!("  {actor_label}  {status}"));
+        }
+    }
+    lines.join("\n")
+}
+
 fn format_directory_entry_show(entry: &fact_sdk::workflow::DirectoryEntry) -> String {
     fn optional(value: Option<&String>) -> &str {
         value.map(String::as_str).unwrap_or("(none)")
@@ -5966,7 +8799,7 @@ fn expanded_help_text() -> String {
 Usage: fact [OPTIONS] <COMMAND>
 
 Starting and Selecting Ledgers:
-  clone           Copy a shared ledger into a read-only local ledger
+  clone           Copy a shared ledger into a local mirror
   from            Register an existing ledger database as read-only
   here            Initialize project-local Fact configuration
   init            Start a new local ledger for your facts
@@ -6016,6 +8849,8 @@ Identity and Directory:
   directory       Manage ledger-scoped friendly identity directory entries
   identity        Manage local identity keys and authority records
   permission      Grant or remove permission to perform ledger actions
+  persona         Manage reusable local signing personas
+  profile         Manage reusable local actor profile metadata
 
 Sync and Remotes:
   pull            Bring ledger data into a local ledger or file
@@ -6027,6 +8862,7 @@ Protocol and Administration:
   conformance     Run implementation conformance checks
   decision        Record a participant decision
   deliberation    Inspect and manage formal discussions
+  http            Run and administer a Facts HTTP collaboration server
   ledger          Manage local ledgers and configuration
   object          Validate, import, and export signed protocol objects
   proof           Add or remove objects from commitment proofs
@@ -6117,7 +8953,17 @@ where
 #[derive(Clone, Debug)]
 struct ConfiguredRemote {
     url: String,
+    ledger: Option<String>,
+    genesis_hash: Option<String>,
     bearer_token: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct AddedRemote {
+    name: String,
+    url: String,
+    ledger: Option<String>,
+    scope: String,
 }
 
 #[derive(Clone, Debug)]
@@ -6125,37 +8971,103 @@ struct CloneSource {
     url: String,
     name_source: String,
     remote_name: Option<String>,
+    ledger: Option<String>,
+    genesis_hash: Option<String>,
     bearer_token: Option<String>,
+    actor: Option<String>,
+    claims: Option<actor_exchange::ActorClaims>,
     is_remote_url: bool,
+    from_descriptor: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteDescriptor {
+    url: String,
+    ledger_id: String,
+    genesis_hash: String,
+    token: Option<String>,
+    namespace: Option<String>,
+    actor: Option<String>,
+    claims: Option<actor_exchange::ActorClaims>,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteLedgerMetadata {
+    ledger_id: String,
+    genesis_hash: Option<String>,
+    namespace: Option<String>,
 }
 
 fn clone_source_from_args(
     environment: &UserEnvironment,
     source: Option<String>,
     remote: Option<String>,
+    descriptor: Option<PathBuf>,
 ) -> Result<CloneSource, Box<dyn std::error::Error>> {
-    match (source, remote) {
-        (Some(source), None) => Ok(CloneSource {
-            is_remote_url: environment::is_remote_url(&source),
-            name_source: source.clone(),
-            url: source,
-            remote_name: None,
-            bearer_token: None,
-        }),
-        (None, Some(remote_name)) => {
+    match (source, remote, descriptor) {
+        (Some(source), None, None) => {
+            let matched_remote = if environment::is_remote_url(&source) {
+                matching_remote(environment, &source)?
+            } else {
+                None
+            };
+            Ok(CloneSource {
+                is_remote_url: environment::is_remote_url(&source),
+                name_source: source.clone(),
+                url: source,
+                remote_name: matched_remote.as_ref().map(|remote| remote.name.clone()),
+                ledger: matched_remote
+                    .as_ref()
+                    .and_then(|remote| remote.ledger.clone()),
+                genesis_hash: matched_remote
+                    .as_ref()
+                    .and_then(|remote| remote.genesis_hash.clone()),
+                bearer_token: matched_remote.and_then(|remote| remote.bearer_token),
+                actor: None,
+                claims: None,
+                from_descriptor: false,
+            })
+        }
+        (None, Some(remote_name), None) => {
             let remote = configured_remote(environment, Some(&remote_name))?;
             Ok(CloneSource {
                 url: remote.url,
                 name_source: remote_name.clone(),
                 remote_name: Some(remote_name),
+                ledger: remote.ledger,
+                genesis_hash: remote.genesis_hash,
                 bearer_token: remote.bearer_token,
+                actor: None,
+                claims: None,
                 is_remote_url: true,
+                from_descriptor: false,
             })
         }
-        (None, None) => Err("fact clone requires SOURCE or --remote NAME".into()),
-        (Some(_), Some(_)) => {
-            Err("fact clone accepts either SOURCE or --remote NAME, not both".into())
+        (None, None, Some(path)) => {
+            let descriptor = read_remote_descriptor(&path)?;
+            validate_remote_descriptor(&descriptor)?;
+            verify_remote_descriptor(&descriptor)?;
+            let remote_name = derive_remote_descriptor_name(&descriptor);
+            let actor = descriptor.actor.clone();
+            let claims = descriptor.claims.clone();
+            let remote = save_remote_descriptor(environment, descriptor, Some(remote_name))?;
+            Ok(CloneSource {
+                url: remote.url,
+                name_source: remote.name.clone(),
+                remote_name: Some(remote.name),
+                ledger: remote.ledger,
+                genesis_hash: remote.genesis_hash,
+                bearer_token: remote.bearer_token,
+                actor,
+                claims,
+                is_remote_url: true,
+                from_descriptor: true,
+            })
         }
+        (None, None, None) => {
+            Err("fact clone requires SOURCE, --remote NAME, or --from FILE".into())
+        }
+        _ => Err("fact clone accepts only one of SOURCE, --remote NAME, or --from FILE".into()),
     }
 }
 
@@ -6169,21 +9081,603 @@ fn configured_remote(
             .get(requested)
             .map(|remote| ConfiguredRemote {
                 url: remote.url.clone(),
+                ledger: remote.ledger.clone(),
+                genesis_hash: remote.genesis_hash.clone(),
                 bearer_token: remote.bearer_token.clone(),
             })
             .unwrap_or_else(|| ConfiguredRemote {
                 url: requested.to_owned(),
+                ledger: None,
+                genesis_hash: None,
                 bearer_token: None,
             }));
     }
     match remotes.values().collect::<Vec<_>>().as_slice() {
         [remote] => Ok(ConfiguredRemote {
             url: remote.url.clone(),
+            ledger: remote.ledger.clone(),
+            genesis_hash: remote.genesis_hash.clone(),
             bearer_token: remote.bearer_token.clone(),
         }),
         [] => Err("no remote is configured; add one with fact ledger remote add NAME URL".into()),
         _ => Err("multiple remotes are configured; pass --remote NAME or URL".into()),
     }
+}
+
+fn matching_remote(
+    environment: &UserEnvironment,
+    url: &str,
+) -> Result<Option<fact_sdk::environment::RemoteEntry>, Box<dyn std::error::Error>> {
+    Ok(environment
+        .load_remotes()?
+        .into_values()
+        .find(|remote| same_remote_url(&remote.url, url)))
+}
+
+fn same_remote_url(left: &str, right: &str) -> bool {
+    left.trim_end_matches('/') == right.trim_end_matches('/')
+}
+
+fn configured_remote_for_ledger(
+    environment: &UserEnvironment,
+    requested: Option<&str>,
+    entry: &LedgerEntry,
+) -> Result<ConfiguredRemote, Box<dyn std::error::Error>> {
+    if let Some(requested) = requested {
+        let remote = configured_remote(environment, Some(requested))?;
+        if let Some(ledger) = &remote.ledger {
+            if ledger != &entry.ledger_id {
+                return Err(format!(
+                    "remote {requested} points to ledger {ledger}, not active ledger {}",
+                    entry.ledger_id
+                )
+                .into());
+            }
+        }
+        return Ok(remote);
+    }
+
+    let remotes = environment.load_remotes()?;
+    let matches = remotes
+        .values()
+        .filter(|remote| remote.ledger.as_deref() == Some(entry.ledger_id.as_str()))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [remote] => Ok(configured_remote_from_entry(remote)),
+        [] => match remotes.values().collect::<Vec<_>>().as_slice() {
+            [remote] if remote.ledger.is_none() => Ok(configured_remote_from_entry(remote)),
+            [] => Err("no remote is configured; add one with fact remote add NAME URL".into()),
+            _ => Err(format!(
+                "no remote is configured for ledger {}; pass --remote NAME or add a ledger-scoped remote",
+                entry.ledger_id
+            )
+            .into()),
+        },
+        _ => Err(format!(
+            "multiple remotes are configured for ledger {}; pass --remote NAME",
+            entry.ledger_id
+        )
+        .into()),
+    }
+}
+
+fn configured_remote_from_entry(remote: &fact_sdk::environment::RemoteEntry) -> ConfiguredRemote {
+    ConfiguredRemote {
+        url: remote.url.clone(),
+        ledger: remote.ledger.clone(),
+        genesis_hash: remote.genesis_hash.clone(),
+        bearer_token: remote.bearer_token.clone(),
+    }
+}
+
+fn scoped_remotes<'a, I>(remotes: I, ledger: &str) -> Vec<&'a fact_sdk::environment::RemoteEntry>
+where
+    I: IntoIterator<Item = &'a fact_sdk::environment::RemoteEntry>,
+{
+    remotes
+        .into_iter()
+        .filter(|remote| remote.ledger.as_deref() == Some(ledger))
+        .collect()
+}
+
+fn print_remote(remote: &fact_sdk::environment::RemoteEntry) {
+    match &remote.ledger {
+        Some(ledger) => match &remote.genesis_hash {
+            Some(genesis_hash) => println!(
+                "{}  {}  {}  {}",
+                remote.name, remote.url, ledger, genesis_hash
+            ),
+            None => println!("{}  {}  {}", remote.name, remote.url, ledger),
+        },
+        None => println!("{}  {}", remote.name, remote.url),
+    }
+}
+
+fn configure_remote_from_descriptor(
+    environment: &UserEnvironment,
+    file: &Path,
+    name: Option<&str>,
+) -> Result<fact_sdk::environment::RemoteEntry, Box<dyn std::error::Error>> {
+    let descriptor = read_remote_descriptor(file)?;
+    validate_remote_descriptor(&descriptor)?;
+    verify_remote_descriptor(&descriptor)?;
+    save_remote_descriptor(environment, descriptor, name.map(str::to_owned))
+}
+
+fn save_remote_descriptor(
+    environment: &UserEnvironment,
+    descriptor: RemoteDescriptor,
+    name: Option<String>,
+) -> Result<fact_sdk::environment::RemoteEntry, Box<dyn std::error::Error>> {
+    let name = name.unwrap_or_else(|| derive_remote_descriptor_name(&descriptor));
+    if !portable_name(&name) {
+        return Err(user_error(format!("invalid remote name: {name}")));
+    }
+    let mut remotes = environment.load_remotes()?;
+    let entry = fact_sdk::environment::RemoteEntry {
+        name: name.clone(),
+        url: descriptor.url,
+        ledger: Some(descriptor.ledger_id),
+        genesis_hash: Some(descriptor.genesis_hash),
+        bearer_token: descriptor.token,
+    };
+    remotes.insert(name, entry.clone());
+    environment.save_remotes(&remotes)?;
+    Ok(entry)
+}
+
+fn read_remote_descriptor(file: &Path) -> Result<RemoteDescriptor, Box<dyn std::error::Error>> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(file)?)?;
+    let schema = value
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| user_error("remote descriptor is missing its format marker"))?;
+    let (descriptor, namespace, actor, claims) = match schema {
+        "fact-remote-v0" => (value, None, None, None),
+        "fact-remote-actor-response-v0" => {
+            verify_remote_actor_response_grants(&value)?;
+            let namespace = value
+                .get("ledger")
+                .and_then(|ledger| ledger.get("namespace"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let actor = value
+                .get("actor")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let claims = value
+                .get("claims")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?;
+            let endpoint = value
+                .get("endpoint")
+                .cloned()
+                .ok_or_else(|| user_error("remote actor response is missing endpoint"))?;
+            (endpoint, namespace, actor, claims)
+        }
+        _ => return Err(user_error("unsupported remote descriptor format")),
+    };
+    let schema = descriptor
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| user_error("remote descriptor endpoint is missing its format marker"))?;
+    if schema != "fact-remote-v0" {
+        return Err(user_error("unsupported remote descriptor endpoint format"));
+    }
+    Ok(RemoteDescriptor {
+        url: required_string(&descriptor, "url")?.to_owned(),
+        ledger_id: required_string(&descriptor, "ledger_id")?.to_owned(),
+        genesis_hash: required_string(&descriptor, "genesis_hash")?.to_owned(),
+        token: descriptor
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        namespace,
+        actor,
+        claims,
+    })
+}
+
+fn required_string<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a str, Box<dyn std::error::Error>> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| user_error(format!("remote descriptor is missing {field}")))
+}
+
+fn validate_remote_descriptor(
+    descriptor: &RemoteDescriptor,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !descriptor.url.starts_with("http://") && !descriptor.url.starts_with("https://") {
+        return Err(user_error(
+            "remote descriptor URL must use http:// or https://",
+        ));
+    }
+    parse_uuid7(&descriptor.ledger_id, "ledger")?;
+    parse_sha256_hex(&descriptor.genesis_hash, "genesis_hash")?;
+    Ok(())
+}
+
+fn parse_sha256_hex(value: &str, field: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fact_core::Hash::from_str(value)
+        .map(|_| ())
+        .map_err(|_| user_error(format!("{field} must be a lowercase SHA-256 hex hash")))
+}
+
+fn verify_remote_descriptor(
+    descriptor: &RemoteDescriptor,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ledgers = discover_remote_ledger_metadata(&descriptor.url)?.ok_or_else(|| {
+        user_error("remote descriptor could not be verified: remote ledger discovery failed")
+    })?;
+    let Some(served) = ledgers
+        .iter()
+        .find(|ledger| ledger.ledger_id == descriptor.ledger_id)
+    else {
+        return Err(user_error(format!(
+            "remote descriptor mismatch: remote does not serve ledger {}; served ledger(s): {}",
+            descriptor.ledger_id,
+            ledgers
+                .iter()
+                .map(|ledger| ledger.ledger_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    };
+    match &served.genesis_hash {
+        Some(genesis_hash) if genesis_hash == &descriptor.genesis_hash => Ok(()),
+        Some(genesis_hash) => Err(user_error(format!(
+            "remote descriptor genesis mismatch for ledger {}: descriptor has {}, remote serves {}",
+            descriptor.ledger_id, descriptor.genesis_hash, genesis_hash
+        ))),
+        None => Err(user_error(format!(
+            "remote descriptor could not be verified: remote did not report genesis_hash for ledger {}",
+            descriptor.ledger_id
+        ))),
+    }
+}
+
+fn verify_remote_actor_response_grants(
+    value: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if value.get("bundle").is_some() {
+        let response: actor_exchange::ActorResponse = serde_json::from_value(value.clone())?;
+        if !actor_exchange::response_grants_match_bundle(&response).map_err(user_error)? {
+            return Err(user_error(
+                "remote actor response grant bundle does not match granted capabilities",
+            ));
+        }
+        return Ok(());
+    }
+    for field in ["signed_grants", "grants"] {
+        let Some(items) = value.get(field).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            let encoded = item
+                .as_str()
+                .or_else(|| item.get("cose_sign1").and_then(serde_json::Value::as_str))
+                .ok_or_else(|| user_error(format!("{field} contains an invalid grant payload")))?;
+            let bytes = decode_base64url(encoded)
+                .ok_or_else(|| user_error(format!("{field} contains invalid base64url")))?;
+            fact_crypto::decode_sign1(&bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn derive_remote_descriptor_name(descriptor: &RemoteDescriptor) -> String {
+    if let Some(name) = descriptor_namespace_name(descriptor) {
+        return name;
+    }
+    let without_scheme = descriptor
+        .url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&descriptor.url);
+    let host = without_scheme
+        .split('/')
+        .next()
+        .unwrap_or("remote")
+        .split('@')
+        .next_back()
+        .unwrap_or("remote")
+        .split(':')
+        .next()
+        .unwrap_or("remote");
+    let mut name = String::new();
+    for byte in host.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            name.push((byte as char).to_ascii_lowercase());
+        } else if matches!(byte, b'-' | b'_') {
+            name.push(byte as char);
+        } else if !name.ends_with('-') {
+            name.push('-');
+        }
+    }
+    let name = name.trim_matches('-').to_owned();
+    if portable_name(&name) {
+        name
+    } else {
+        format!("remote-{}", ledger_short_reference(&descriptor.ledger_id))
+    }
+}
+
+fn descriptor_namespace_name(descriptor: &RemoteDescriptor) -> Option<String> {
+    let raw = descriptor.namespace.as_ref()?.rsplit('.').next()?;
+    let name = portable_name_from_text(raw);
+    portable_name(&name).then_some(name)
+}
+
+fn portable_name_from_text(value: &str) -> String {
+    let mut name = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    name = name.trim_matches('-').to_owned();
+    if name.is_empty() {
+        "clone".to_owned()
+    } else {
+        name
+    }
+}
+
+fn ledger_short_reference(ledger_id: &str) -> String {
+    let compact = ledger_id.replace('-', "");
+    format!("{}-{}", &compact[..5], &compact[compact.len() - 5..])
+}
+
+fn portable_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn remote_add_ledger(
+    environment: &UserEnvironment,
+    url: &str,
+    requested: Option<&str>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if let Some(ledger) = requested {
+        return match environment.resolve_ledger_id(ledger) {
+            Ok(ledger_id) => Ok(Some(ledger_id)),
+            Err(local_error) => resolve_remote_advertised_ledger(url, ledger)
+                .map(Some)
+                .map_err(|remote_error| {
+                    user_error(format!(
+                        "{}; remote lookup also failed: {}",
+                        user_facing_error(&local_error),
+                        user_facing_error(remote_error.as_ref())
+                    ))
+                }),
+        };
+    }
+    discover_single_remote_ledger(url)
+}
+
+fn resolve_remote_advertised_ledger(
+    url: &str,
+    requested: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let Some(ledgers) = discover_remote_ledger_metadata(url)? else {
+        return Err(user_error("remote ledger discovery failed"));
+    };
+    let matches = ledgers
+        .iter()
+        .filter(|ledger| {
+            ledger.ledger_id == requested
+                || ledger.namespace.as_deref() == Some(requested)
+                || ledger_short_reference(&ledger.ledger_id) == requested
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [ledger] => Ok(ledger.ledger_id.clone()),
+        [] => Err(user_error(format!(
+            "remote does not advertise ledger {requested}; available ledgers: {}",
+            remote_ledger_choices(&ledgers)
+        ))),
+        _ => Err(user_error(format!(
+            "remote ledger reference {requested} is ambiguous; available ledgers: {}",
+            remote_ledger_choices(&ledgers)
+        ))),
+    }
+}
+
+fn remote_ledger_choices(ledgers: &[RemoteLedgerMetadata]) -> String {
+    ledgers
+        .iter()
+        .map(|ledger| match &ledger.namespace {
+            Some(namespace) => format!("{} ({namespace})", ledger.ledger_id),
+            None => ledger.ledger_id.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn discover_single_remote_ledger(url: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some(ledger_ids) = discover_remote_ledgers(url)? else {
+        return Ok(None);
+    };
+    match ledger_ids.as_slice() {
+        [ledger] => Ok(Some(ledger.clone())),
+        [] => Ok(None),
+        ledgers => Err(format!(
+            "remote serves multiple ledgers; pass --ledger with one of: {}",
+            ledgers.join(", ")
+        )
+        .into()),
+    }
+}
+
+fn discover_remote_ledgers(url: &str) -> Result<Option<Vec<String>>, Box<dyn std::error::Error>> {
+    Ok(discover_remote_ledger_metadata(url)?.map(|ledgers| {
+        ledgers
+            .into_iter()
+            .map(|ledger| ledger.ledger_id)
+            .collect::<Vec<_>>()
+    }))
+}
+
+fn discover_remote_ledger_metadata(
+    url: &str,
+) -> Result<Option<Vec<RemoteLedgerMetadata>>, Box<dyn std::error::Error>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+    let endpoint = format!("{}/facts/ledgers", url.trim_end_matches('/'));
+    let response = match client.get(endpoint).send() {
+        Ok(response) => response,
+        Err(_) => return Ok(None),
+    };
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let value: serde_json::Value = response.json()?;
+    let body = value.get("body").unwrap_or(&value);
+    let ledgers = body
+        .get("ledgers")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| user_error("remote ledger list response did not include ledgers"))?;
+    let ledger_ids = ledgers
+        .iter()
+        .map(|ledger| {
+            let ledger_id = ledger
+                .get("ledger_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| user_error("remote ledger list entry is missing ledger_id"))?;
+            let ledger_id = parse_uuid7(ledger_id, "ledger").map(|ledger| ledger.to_string())?;
+            let genesis_hash = ledger
+                .get("genesis_hash")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| parse_sha256_hex(value, "genesis_hash").map(|_| value.to_owned()))
+                .transpose()?;
+            let namespace = ledger
+                .get("namespace")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            Ok::<RemoteLedgerMetadata, Box<dyn std::error::Error>>(RemoteLedgerMetadata {
+                ledger_id,
+                genesis_hash,
+                namespace,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(ledger_ids))
+}
+
+fn validate_remote_serves_ledger(
+    remote: &str,
+    ledger: uuid::Uuid,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(ledger_ids) = discover_remote_ledgers(remote)? else {
+        return Ok(());
+    };
+    if ledger_ids.is_empty()
+        || ledger_ids
+            .iter()
+            .any(|candidate| candidate == &ledger.to_string())
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "remote serves ledger(s) {}, not local ledger {}; use `fact clone` to mirror a remote ledger; an empty local ledger cannot be turned into a mirror",
+        ledger_ids.join(", "),
+        ledger
+    )
+    .into())
+}
+
+fn add_remote_with_ledger(
+    environment: &UserEnvironment,
+    name: &str,
+    url: &str,
+    ledger: Option<String>,
+) -> Result<AddedRemote, Box<dyn std::error::Error>> {
+    let result = environment::add_remote(environment, name, url)?;
+    let mut remotes = environment.load_remotes()?;
+    if let Some(remote) = remotes.get_mut(name) {
+        remote.ledger = ledger.clone();
+    }
+    environment.save_remotes(&remotes)?;
+    Ok(AddedRemote {
+        name: result.name,
+        url: result.url.unwrap_or_else(|| url.to_owned()),
+        ledger,
+        scope: result.scope,
+    })
+}
+
+fn clone_remote_to_create(
+    environment: &UserEnvironment,
+    name: &str,
+    source: &CloneSource,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if !source.is_remote_url || source.remote_name.is_some() {
+        return Ok(None);
+    }
+    let remotes = environment.load_remotes()?;
+    if remotes
+        .values()
+        .any(|remote| same_remote_url(&remote.url, &source.url))
+    {
+        return Ok(None);
+    }
+    if remotes.contains_key(name) {
+        return Err(format!(
+            "remote already exists: {name}; pass --remote NAME to reuse it or choose another clone name"
+        )
+        .into());
+    }
+    Ok(Some(name.to_owned()))
+}
+
+fn save_clone_remote(
+    environment: &UserEnvironment,
+    name: &str,
+    source: &CloneSource,
+    ledger: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut remotes = environment.load_remotes()?;
+    remotes.insert(
+        name.to_owned(),
+        fact_sdk::environment::RemoteEntry {
+            name: name.to_owned(),
+            url: source.url.clone(),
+            ledger: Some(ledger.to_owned()),
+            genesis_hash: source.genesis_hash.clone(),
+            bearer_token: None,
+        },
+    );
+    environment.save_remotes(&remotes)?;
+    Ok(())
+}
+
+fn record_remote_ledger_if_missing(
+    environment: &UserEnvironment,
+    name: &str,
+    ledger: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut remotes = environment.load_remotes()?;
+    let Some(remote) = remotes.get_mut(name) else {
+        return Ok(());
+    };
+    if remote.ledger.is_none() {
+        remote.ledger = Some(ledger.to_owned());
+        environment.save_remotes(&remotes)?;
+    }
+    Ok(())
 }
 
 fn personal_push(
@@ -6297,8 +9791,94 @@ fn ensure_active_entry(
     Ok(environment.resolve(requested)?)
 }
 
+fn read_seed_for_write(
+    environment: &UserEnvironment,
+    entry: &LedgerEntry,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    match environment.read_seed(entry) {
+        Ok(seed) => Ok(seed),
+        Err(fact_sdk::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(user_error(format!(
+                "local private key material is missing for ledger {} actor {}; run `fact status` and restore or rotate the identity key",
+                entry.name, entry.actor_id
+            )))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn ensure_initial_admin_directory_entry(
+    environment: &UserEnvironment,
+    entry: &LedgerEntry,
+    require_seed: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if fact_sdk::workflow::show_directory_entry(entry, &entry.actor_id).is_ok() {
+        return Ok(false);
+    }
+    let seed = match read_seed_for_write(environment, entry) {
+        Ok(seed) => seed,
+        Err(error) if !require_seed => {
+            let _ = error;
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    let actor_id = uuid::Uuid::parse_str(&entry.actor_id)?;
+    let key_id = uuid::Uuid::parse_str(&entry.key_id)?;
+    let default_profile = default_profile(environment)?;
+    let persona = if default_profile.is_none() {
+        persona_for_actor(environment, &entry.actor_id)?
+    } else {
+        None
+    };
+    let (metadata_source, display_name, alias, actor_type, role) =
+        if let Some((name, profile)) = default_profile {
+            (
+                Some(format!("profile:{name}")),
+                profile.display_name,
+                profile.alias,
+                profile.actor_type,
+                profile.role.or_else(|| Some("admin".to_owned())),
+            )
+        } else if let Some((name, persona)) = persona {
+            (
+                Some(format!("persona:{name}")),
+                persona.display_name,
+                persona.alias,
+                persona.actor_type,
+                Some("admin".to_owned()),
+            )
+        } else {
+            (
+                Some("fact init".to_owned()),
+                "Ledger Admin".to_owned(),
+                None,
+                "human".to_owned(),
+                Some("admin".to_owned()),
+            )
+        };
+    fact_sdk::workflow::add_directory_entry(
+        entry,
+        &seed,
+        fact_sdk::workflow::DirectoryAddInput {
+            display_name,
+            actor_id: Some(actor_id),
+            key_id: Some(key_id),
+            alias,
+            actor_type: Some(actor_type),
+            role,
+            source: metadata_source,
+            verified_by: Some("genesis".to_owned()),
+            with_identity: false,
+            seed: None,
+        },
+    )?;
+    Ok(true)
+}
+
 fn default_identity_export_file(
     entry: &LedgerEntry,
+    actor: Option<uuid::Uuid>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let ledger_segment = if entry.name.is_empty() {
         let ledger_id = uuid::Uuid::parse_str(&entry.ledger_id)?;
@@ -6306,12 +9886,183 @@ fn default_identity_export_file(
     } else {
         entry.name.clone()
     };
-    let actor_id = uuid::Uuid::parse_str(&entry.actor_id)?;
+    let actor_id = actor
+        .map(Ok)
+        .unwrap_or_else(|| uuid::Uuid::parse_str(&entry.actor_id))?;
     let actor_segment = fact_sdk::reference::short_uuid_reference(actor_id);
 
     Ok(PathBuf::from(format!(
         "{ledger_segment}.identity.{actor_segment}.bundle"
     )))
+}
+
+fn identity_export_entry_for_actor(
+    environment: &UserEnvironment,
+    entry: &LedgerEntry,
+    actor_id: uuid::Uuid,
+) -> Result<LedgerEntry, Box<dyn std::error::Error>> {
+    let mut scoped = entry.clone();
+    scoped.actor_id = actor_id.to_string();
+    scoped.seed_file = environment.identity_dir.join(format!("{actor_id}.seed"));
+    let store = fact_store::Store::open(&entry.database)?;
+    if let Some((_, key_id)) = store.get_actor_key_binding_for_actor(actor_id.as_bytes())? {
+        scoped.key_id = key_id.to_string();
+    }
+    Ok(scoped)
+}
+
+fn identity_bundle_actor_values(
+    bundle: &[u8],
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let bundle =
+        fact_commitment::decode_bundle(bundle).map_err(|error| user_error(error.to_string()))?;
+    let mut actors = bundle
+        .objects
+        .iter()
+        .filter_map(|object| {
+            let payload = fact_crypto::decode_sign1(object).ok()?.payload;
+            let value = serde_json::from_slice::<serde_json::Value>(&payload).ok()?;
+            (value.get("object_type").and_then(serde_json::Value::as_str) == Some("actor"))
+                .then_some(value)
+        })
+        .map(|value| {
+            let actor_id = value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())?;
+            Some(serde_json::json!({
+                "actor_id": actor_id,
+                "actor_ref": fact_sdk::reference::short_uuid_reference(actor_id),
+            }))
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| user_error("identity bundle contains an invalid actor object"))?;
+    actors.sort_by_key(|actor| {
+        actor["actor_id"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_default()
+    });
+    Ok(actors)
+}
+
+struct IdentityImportBundle {
+    identity_bundle: Vec<u8>,
+    directory_bundle: Option<Vec<u8>>,
+}
+
+#[derive(serde::Deserialize)]
+struct IdentityExportEnvelope {
+    schema: String,
+    identity_bundle: String,
+    directory_bundle: Option<String>,
+}
+
+fn read_identity_import_bundle(
+    bytes: &[u8],
+) -> Result<IdentityImportBundle, Box<dyn std::error::Error>> {
+    if bytes
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        != Some(b'{')
+    {
+        return Ok(IdentityImportBundle {
+            identity_bundle: bytes.to_vec(),
+            directory_bundle: None,
+        });
+    }
+    let envelope: IdentityExportEnvelope = serde_json::from_slice(bytes)?;
+    if envelope.schema != IDENTITY_EXPORT_SCHEMA {
+        return Err(user_error("identity import expected an identity bundle"));
+    }
+    let identity_bundle = decode_base64url(&envelope.identity_bundle)
+        .ok_or_else(|| user_error("identity_bundle contains invalid base64url"))?;
+    let directory_bundle = envelope
+        .directory_bundle
+        .as_deref()
+        .map(|value| {
+            decode_base64url(value)
+                .ok_or_else(|| user_error("directory_bundle contains invalid base64url"))
+        })
+        .transpose()?;
+    Ok(IdentityImportBundle {
+        identity_bundle,
+        directory_bundle,
+    })
+}
+
+fn identity_export_bundle_with_directory(
+    entry: &LedgerEntry,
+    identity_bundle: &[u8],
+    actor_ids: &[uuid::Uuid],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let directory = fact_sdk::workflow::export_directory(entry)?;
+    let directory_bundle = filter_directory_bundle_for_actors(&directory.bundle, actor_ids)?;
+    let Some(directory_bundle) = directory_bundle else {
+        return Ok(identity_bundle.to_vec());
+    };
+    Ok(serde_json::to_vec_pretty(&serde_json::json!({
+        "schema": IDENTITY_EXPORT_SCHEMA,
+        "identity_bundle": encode_base64url(identity_bundle),
+        "directory_bundle": encode_base64url(&directory_bundle),
+    }))?)
+}
+
+fn filter_directory_bundle_for_actors(
+    bundle: &[u8],
+    actor_ids: &[uuid::Uuid],
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    let mut value: serde_json::Value = serde_json::from_slice(bundle)?;
+    let Some(events) = value
+        .get_mut("events")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Err(user_error("directory bundle has no events"));
+    };
+    events.retain(|event| {
+        event
+            .get("target_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .is_some_and(|actor_id| actor_ids.contains(&actor_id))
+    });
+    if events.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_vec_pretty(&value)?))
+}
+
+fn identity_import_result_value(
+    result: &fact_sdk::workflow::ImportIdentityResult,
+    directory: Option<&fact_sdk::workflow::ImportDirectoryResult>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let mut value = serde_json::to_value(result)?;
+    if let Some(directory) = directory {
+        value["directory"] = serde_json::to_value(directory)?;
+    }
+    Ok(value)
+}
+
+fn encode_base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut index = 0;
+    while index < bytes.len() {
+        let b0 = bytes[index];
+        let b1 = bytes.get(index + 1).copied().unwrap_or(0);
+        let b2 = bytes.get(index + 2).copied().unwrap_or(0);
+        output.push(ALPHABET[(b0 >> 2) as usize] as char);
+        output.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if index + 1 < bytes.len() {
+            output.push(ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        }
+        if index + 2 < bytes.len() {
+            output.push(ALPHABET[(b2 & 0x3f) as usize] as char);
+        }
+        index += 3;
+    }
+    output
 }
 
 mod fact_as {
@@ -6322,6 +10073,7 @@ mod fact_as {
         pub alias: Option<String>,
         pub self_actor: bool,
         pub actor_type: Option<String>,
+        pub profile: Option<String>,
         pub role: Option<String>,
         pub source: Option<String>,
         pub verified_by: Option<String>,
@@ -6337,8 +10089,14 @@ mod fact_as {
 
     pub fn run(input: Input) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let environment = UserEnvironment::discover()?;
-        let ledger_name = selected_ledger_name(&environment, input.ledger.as_deref())?;
-        let mut entry = environment.resolve(Some(&ledger_name))?;
+        let mut entry = match input.ledger.as_deref() {
+            Some(ledger) => environment.resolve(Some(ledger))?,
+            None => {
+                let ledger_name = selected_ledger_name(&environment, None)?;
+                environment.resolve(Some(&ledger_name))?
+            }
+        };
+        let ledger_name = entry.name.clone();
         if reports_current_signer(&input) {
             return current_signer_value(&environment, &ledger_name, &entry);
         }
@@ -6350,15 +10108,29 @@ mod fact_as {
         let permissions =
             expanded_optional_capabilities(input.permission.clone(), input.participate);
         validate_capabilities(&permissions)?;
+        if !permissions.is_empty() {
+            ensure_can_grant_permissions(&entry)?;
+        }
+        let profile = input
+            .profile
+            .as_deref()
+            .map(|name| named_profile(&environment, name).map(|profile| (name.to_owned(), profile)))
+            .transpose()?;
+        let profile_ref = profile
+            .as_ref()
+            .map(|(name, profile)| (name.as_str(), profile));
 
         let outcome = if input.self_actor {
             let display_name = input
                 .name
                 .clone()
+                .or_else(|| profile_ref.map(|(_, profile)| profile.display_name.clone()))
                 .ok_or_else(|| user_error("fact as --self requires a display name"))?;
             let alias = input
                 .alias
                 .clone()
+                .or_else(|| profile_ref.and_then(|(_, profile)| profile.alias.clone()))
+                .or_else(|| profile_ref.map(|(name, _)| name.to_owned()))
                 .ok_or_else(|| user_error("fact as --self requires --alias"))?;
             if input.home.is_some() {
                 return Err(user_error("--self does not create actor homes"));
@@ -6366,7 +10138,7 @@ mod fact_as {
             if !permissions.is_empty() {
                 return Err(user_error("--self does not grant permissions"));
             }
-            let seed = environment.read_seed(&entry)?;
+            let seed = read_seed_for_write(&environment, &entry)?;
             let actor_id = uuid::Uuid::parse_str(&entry.actor_id)?;
             let key_id = uuid::Uuid::parse_str(&entry.key_id)?;
             let existing = resolve_existing(&entry, &alias)?;
@@ -6390,13 +10162,16 @@ mod fact_as {
                     alias: Some(alias),
                     actor_type: input
                         .actor_type
+                        .or_else(|| profile_ref.map(|(_, profile)| profile.actor_type.clone()))
                         .or_else(|| current.as_ref().and_then(|entry| entry.actor_type.clone()))
                         .or_else(|| Some("human".to_owned())),
                     role: input
                         .role
+                        .or_else(|| profile_ref.and_then(|(_, profile)| profile.role.clone()))
                         .or_else(|| current.as_ref().and_then(|entry| entry.role.clone())),
                     source: input
                         .source
+                        .or_else(|| profile_ref.map(|(name, _)| format!("profile:{name}")))
                         .or_else(|| current.as_ref().and_then(|entry| entry.source.clone())),
                     verified_by: input
                         .verified_by
@@ -6419,7 +10194,7 @@ mod fact_as {
                 self_mode: true,
             }
         } else {
-            let (display_name, alias, alias_only) = requested_actor(&input)?;
+            let (display_name, alias, alias_only) = requested_actor(&input, profile_ref)?;
             let existing = resolve_existing(&entry, &alias)?;
             if let Some(existing) = existing {
                 if let Some(display_name) = &display_name {
@@ -6445,7 +10220,7 @@ mod fact_as {
                     .ok_or_else(|| user_error("directory entry has no signing key"))?;
                 let seed_file = local_seed_file(&environment, &entry, existing.actor_id, key_id)?;
                 if !permissions.is_empty() {
-                    let seed = environment.read_seed(&entry)?;
+                    let seed = read_seed_for_write(&environment, &entry)?;
                     let grant = fact_sdk::workflow::create_identity_grant(
                         &entry,
                         &seed,
@@ -6455,7 +10230,7 @@ mod fact_as {
                     permission_grants.push(serde_json::to_value(grant)?);
                 }
                 if input.update_directory && display_name.is_some() {
-                    let seed = environment.read_seed(&entry)?;
+                    let seed = read_seed_for_write(&environment, &entry)?;
                     let current = fact_sdk::workflow::show_directory_entry(
                         &entry,
                         &existing.actor_id.to_string(),
@@ -6470,14 +10245,25 @@ mod fact_as {
                             key_id: Some(key_id),
                             alias: Some(alias.clone()),
                             actor_type: input.actor_type.clone().or_else(|| {
-                                current.as_ref().and_then(|entry| entry.actor_type.clone())
+                                profile_ref
+                                    .map(|(_, profile)| profile.actor_type.clone())
+                                    .or_else(|| {
+                                        current.as_ref().and_then(|entry| entry.actor_type.clone())
+                                    })
                             }),
                             role: input
                                 .role
                                 .clone()
+                                .or_else(|| {
+                                    profile_ref.and_then(|(_, profile)| profile.role.clone())
+                                })
                                 .or_else(|| current.as_ref().and_then(|entry| entry.role.clone())),
                             source: input.source.clone().or_else(|| {
-                                current.as_ref().and_then(|entry| entry.source.clone())
+                                profile_ref
+                                    .map(|(name, _)| format!("profile:{name}"))
+                                    .or_else(|| {
+                                        current.as_ref().and_then(|entry| entry.source.clone())
+                                    })
                             }),
                             verified_by: input.verified_by.clone().or_else(|| {
                                 current.as_ref().and_then(|entry| entry.verified_by.clone())
@@ -6513,7 +10299,7 @@ mod fact_as {
                 }
                 let display_name = display_name
                     .ok_or_else(|| user_error("creating an identity requires a display name"))?;
-                let seed = environment.read_seed(&entry)?;
+                let seed = read_seed_for_write(&environment, &entry)?;
                 let result = fact_sdk::workflow::add_directory_entry(
                     &entry,
                     &seed,
@@ -6526,10 +10312,19 @@ mod fact_as {
                             input
                                 .actor_type
                                 .clone()
+                                .or_else(|| {
+                                    profile_ref.map(|(_, profile)| profile.actor_type.clone())
+                                })
                                 .unwrap_or_else(|| "human".to_owned()),
                         ),
-                        role: input.role.clone(),
-                        source: input.source.clone(),
+                        role: input
+                            .role
+                            .clone()
+                            .or_else(|| profile_ref.and_then(|(_, profile)| profile.role.clone())),
+                        source: input
+                            .source
+                            .clone()
+                            .or_else(|| profile_ref.map(|(name, _)| format!("profile:{name}"))),
                         verified_by: input.verified_by.clone(),
                         with_identity: true,
                         seed: None,
@@ -6568,6 +10363,11 @@ mod fact_as {
         };
 
         if !outcome.self_mode {
+            if switching_from_only_admin(&entry, outcome.actor_id)? {
+                eprintln!(
+                    "warning: switching away from the only actor with admin capability in this ledger"
+                );
+            }
             entry = switch_actor(&environment, &ledger_name, entry, &outcome)?;
             switched = true;
         }
@@ -6628,6 +10428,7 @@ mod fact_as {
             && input.alias.is_none()
             && !input.self_actor
             && input.actor_type.is_none()
+            && input.profile.is_none()
             && input.role.is_none()
             && input.source.is_none()
             && input.verified_by.is_none()
@@ -6739,7 +10540,20 @@ mod fact_as {
 
     fn requested_actor(
         input: &Input,
+        profile: Option<(&str, &ActorProfile)>,
     ) -> Result<(Option<String>, String, bool), Box<dyn std::error::Error>> {
+        if let Some((profile_name, profile)) = profile {
+            let display_name = input
+                .name
+                .clone()
+                .unwrap_or_else(|| profile.display_name.clone());
+            let alias = input
+                .alias
+                .clone()
+                .or_else(|| profile.alias.clone())
+                .unwrap_or_else(|| profile_name.to_owned());
+            return Ok((Some(display_name), alias, false));
+        }
         match (input.name.clone(), input.alias.clone()) {
             (Some(name), Some(alias)) => Ok((Some(name), alias, false)),
             (Some(alias), None) => Ok((None, alias, true)),
@@ -6781,6 +10595,44 @@ mod fact_as {
         Err(user_error(format!(
             "local private key material is not available for {actor_id}"
         )))
+    }
+
+    fn ensure_can_grant_permissions(entry: &LedgerEntry) -> Result<(), Box<dyn std::error::Error>> {
+        let has_admin = held_capabilities(entry)?
+            .iter()
+            .any(|capability| capability.name == "admin");
+        if has_admin {
+            Ok(())
+        } else {
+            Err(user_error(
+                "your current identity does not have permission to do that in this ledger",
+            ))
+        }
+    }
+
+    fn switching_from_only_admin(
+        entry: &LedgerEntry,
+        next_actor: uuid::Uuid,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let current_actor = uuid::Uuid::parse_str(&entry.actor_id)?;
+        if current_actor == next_actor {
+            return Ok(false);
+        }
+        let store = fact_store::Store::open(&entry.database)?;
+        let admins = store
+            .list_identity_objects()?
+            .into_iter()
+            .filter(|(_, _, object_type)| object_type == "actor")
+            .filter_map(|(actor_id, _, _)| {
+                actor_capabilities_in_store(&store, entry, actor_id)
+                    .ok()
+                    .is_some_and(|capabilities| {
+                        capabilities.iter().any(|capability| capability == "admin")
+                    })
+                    .then_some(actor_id)
+            })
+            .collect::<Vec<_>>();
+        Ok(admins.as_slice() == [current_actor])
     }
 
     fn switch_actor(
@@ -6900,6 +10752,7 @@ fn clone_read_only_ledger(
     ledger: &str,
     actor: Option<CloneActorBinding>,
 ) -> Result<LedgerEntry, Box<dyn std::error::Error>> {
+    let clone_remote = clone_remote_to_create(environment, name, source)?;
     let bundle_path =
         std::env::temp_dir().join(format!("fact-clone-{}.bundle", uuid::Uuid::now_v7()));
     if source.is_remote_url {
@@ -6908,6 +10761,14 @@ fn clone_read_only_ledger(
         let mut args = vec![
             "sync".to_owned(),
             "pull".to_owned(),
+            "--remote".to_owned(),
+            source.url.clone(),
+        ];
+        if let Some(token) = &source.bearer_token {
+            args.push(format!("--bearer-token={token}"));
+        }
+        args.extend([
+            "--".to_owned(),
             database
                 .to_str()
                 .ok_or("invalid temporary database path")?
@@ -6917,13 +10778,7 @@ fn clone_read_only_ledger(
                 .to_str()
                 .ok_or("invalid temporary bundle path")?
                 .to_owned(),
-            "--remote".to_owned(),
-            source.url.clone(),
-        ];
-        if let Some(token) = &source.bearer_token {
-            args.push("--bearer-token".to_owned());
-            args.push(token.clone());
-        }
+        ]);
         let args = args.iter().map(String::as_str).collect::<Vec<_>>();
         let status = ProcessCommand::new(std::env::current_exe()?)
             .args(args)
@@ -6939,34 +10794,235 @@ fn clone_read_only_ledger(
     }
     let bytes = fs::read(&bundle_path)?;
     let _ = fs::remove_file(&bundle_path);
-    let objects = environment::decode_clone_source_objects(&bytes)?;
-    let entry = environment::clone_read_only_ledger_from_objects(
-        environment,
-        name,
-        ledger,
-        &objects,
-        source.is_remote_url.then_some(source.url.as_str()),
-    )?;
-    if source.is_remote_url {
-        if let Some(token) = &source.bearer_token {
-            environment::set_remote_bearer_token(environment, name, Some(token.clone()))?;
-        }
+    let mut objects = environment::decode_clone_source_objects(&bytes)?;
+    if let Some(actor) = &actor {
+        objects.splice(
+            0..0,
+            local_actor_identity_objects_not_in(environment, actor, &objects)?,
+        );
     }
-    if let Some(actor) = actor {
+    let entry =
+        environment::clone_read_only_ledger_from_objects(environment, name, ledger, &objects, None)
+            .map_err(|error| contextualize_clone_import_error(error, &objects))?;
+    let entry = if let Some(actor) = actor {
         match bind_cloned_ledger_actor(environment, name, &entry, actor) {
-            Ok(entry) => return Ok(entry),
+            Ok(entry) => entry,
             Err(error) => {
                 let _ = environment::delete_ledger(environment, name, true);
                 return Err(error);
             }
         }
+    } else {
+        entry
+    };
+    apply_actor_response_claims_to_clone(environment, &entry, source)?;
+    if let Some(remote_name) = clone_remote {
+        save_clone_remote(environment, &remote_name, source, ledger)?;
+    } else if let Some(remote_name) = &source.remote_name {
+        record_remote_ledger_if_missing(environment, remote_name, ledger)?;
     }
     Ok(entry)
+}
+
+fn apply_actor_response_claims_to_clone(
+    environment: &UserEnvironment,
+    entry: &LedgerEntry,
+    source: &CloneSource,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if entry.read_only || source.actor.as_deref() != Some(entry.actor_id.as_str()) {
+        return Ok(());
+    }
+    let Some(claims) = &source.claims else {
+        return Ok(());
+    };
+    let Some(display_name) = claims.display_name.clone() else {
+        return Ok(());
+    };
+    let actor_id = uuid::Uuid::parse_str(&entry.actor_id)?;
+    let key_id = uuid::Uuid::parse_str(&entry.key_id)?;
+    let seed = read_seed_for_write(environment, entry)?;
+    fact_sdk::workflow::add_directory_entry(
+        entry,
+        &seed,
+        fact_sdk::workflow::DirectoryAddInput {
+            display_name,
+            actor_id: Some(actor_id),
+            key_id: Some(key_id),
+            alias: claims.alias.clone(),
+            actor_type: claims.actor_type.clone(),
+            role: None,
+            source: Some("actor-response-clone".to_owned()),
+            verified_by: None,
+            with_identity: false,
+            seed: None,
+        },
+    )?;
+    Ok(())
 }
 
 struct CloneActorBinding {
     input: String,
     actor_id: Option<uuid::Uuid>,
+}
+
+#[derive(Debug)]
+struct CloneObjectInfo {
+    id: String,
+    object_type: String,
+    ledger_id: Option<String>,
+    actor_id: Option<String>,
+    signing_key_id: Option<String>,
+    dependencies: Vec<String>,
+    receiving_actor_id: Option<String>,
+    binding_actor_id: Option<String>,
+    binding_key_id: Option<String>,
+}
+
+fn contextualize_clone_import_error(
+    error: fact_sdk::Error,
+    objects: &[Vec<u8>],
+) -> Box<dyn std::error::Error> {
+    let dependency_related = matches!(
+        error,
+        fact_sdk::Error::Store(
+            fact_store::Error::MissingDependency
+                | fact_store::Error::MissingKey
+                | fact_store::Error::MissingLedger
+                | fact_store::Error::InvalidLineage
+        )
+    );
+    if !dependency_related {
+        return error.into();
+    }
+    match clone_dependency_diagnostic(objects) {
+        Some(diagnostic) => user_error(format!("{error}; {diagnostic}")),
+        None => error.into(),
+    }
+}
+
+fn clone_dependency_diagnostic(objects: &[Vec<u8>]) -> Option<String> {
+    let infos = objects
+        .iter()
+        .filter_map(|object| clone_object_info(object).ok())
+        .collect::<Vec<_>>();
+    let ids = infos
+        .iter()
+        .map(|info| info.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut diagnostics = Vec::new();
+    for info in &infos {
+        if let Some(actor_id) = &info.receiving_actor_id {
+            if !ids.contains(actor_id.as_str()) {
+                diagnostics.push(format!(
+                    "authorization grant {} references missing receiving actor identity {actor_id}; import or include the relevant identity bundle",
+                    info.id
+                ));
+            }
+        }
+    }
+    for info in &infos {
+        for dependency in &info.dependencies {
+            if !ids.contains(dependency.as_str()) {
+                diagnostics.push(format!(
+                    "missing dependency object {dependency} referenced by {} {}",
+                    info.object_type, info.id
+                ));
+            }
+        }
+        if let Some(actor_id) = &info.actor_id {
+            if !ids.contains(actor_id.as_str()) {
+                diagnostics.push(format!(
+                    "missing actor identity {actor_id} for signer of {} {}; import or include the relevant identity bundle",
+                    info.object_type, info.id
+                ));
+            }
+        }
+        if let Some(key_id) = &info.signing_key_id {
+            if !ids.contains(key_id.as_str()) {
+                diagnostics.push(format!(
+                    "missing key identity {key_id} for signer of {} {}; import or include the relevant identity bundle",
+                    info.object_type, info.id
+                ));
+            }
+        }
+        if let Some(actor_id) = &info.binding_actor_id {
+            if !ids.contains(actor_id.as_str()) {
+                diagnostics.push(format!(
+                    "actor-key binding {} references missing actor identity {actor_id}; import or include the relevant identity bundle",
+                    info.id
+                ));
+            }
+        }
+        if let Some(key_id) = &info.binding_key_id {
+            if !ids.contains(key_id.as_str()) {
+                diagnostics.push(format!(
+                    "actor-key binding {} references missing key identity {key_id}; import or include the relevant identity bundle",
+                    info.id
+                ));
+            }
+        }
+    }
+    let ledger_ids = infos
+        .iter()
+        .filter_map(|info| info.ledger_id.as_deref())
+        .collect::<std::collections::HashSet<_>>();
+    for ledger_id in ledger_ids {
+        if !infos.iter().any(|info| {
+            info.ledger_id.as_deref() == Some(ledger_id) && info.object_type == "genesis"
+        }) {
+            diagnostics.push(format!(
+                "missing ledger-scoped genesis object for ledger {ledger_id}"
+            ));
+        }
+    }
+    diagnostics.dedup();
+    diagnostics.into_iter().next()
+}
+
+fn clone_object_info(bytes: &[u8]) -> Result<CloneObjectInfo, Box<dyn std::error::Error>> {
+    let payload = fact_crypto::decode_sign1(bytes)?.payload;
+    let value: serde_json::Value = serde_json::from_slice(&payload)?;
+    let body = value.get("body").and_then(serde_json::Value::as_object);
+    Ok(CloneObjectInfo {
+        id: required_string(&value, "id")?.to_owned(),
+        object_type: required_string(&value, "object_type")?.to_owned(),
+        ledger_id: value
+            .get("ledger_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        actor_id: value
+            .get("actor_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        signing_key_id: value
+            .get("signing_key_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        dependencies: value
+            .get("dependencies")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|dependency| {
+                dependency
+                    .get("object_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect(),
+        receiving_actor_id: body
+            .and_then(|body| body.get("receiving_actor_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        binding_actor_id: body
+            .and_then(|body| body.get("actor_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        binding_key_id: body
+            .and_then(|body| body.get("key_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
 }
 
 fn clone_actor_binding(
@@ -6985,11 +11041,36 @@ fn clone_actor_binding(
             },
             Err(_) => None,
         }
+        .or_else(|| {
+            local_actor_registry_entry(environment, actor)
+                .ok()
+                .and_then(|entry| uuid::Uuid::parse_str(&entry.actor_id).ok())
+        })
     };
     Ok(CloneActorBinding {
         input: actor.to_owned(),
         actor_id,
     })
+}
+
+fn inferred_clone_actor_binding(
+    environment: &UserEnvironment,
+    source: &CloneSource,
+) -> Result<Option<CloneActorBinding>, Box<dyn std::error::Error>> {
+    let Some(actor) = source.actor.as_deref() else {
+        return Ok(None);
+    };
+    let actor_id = uuid::Uuid::parse_str(actor)?;
+    if local_actor_request_identity(environment, actor, Some(actor_id))?
+        .is_some_and(|local| local.seed_file.exists())
+    {
+        Ok(Some(CloneActorBinding {
+            input: actor.to_owned(),
+            actor_id: Some(actor_id),
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 fn resolve_cloned_ledger_actor(
@@ -7015,6 +11096,9 @@ fn bind_cloned_ledger_actor(
         Some(actor_id) => actor_id,
         None => resolve_cloned_ledger_actor(entry, &actor.input)?,
     };
+    if store.get_cose_by_id_any(actor_id.as_bytes())?.is_none() {
+        import_local_actor_identity_into_clone(environment, entry, &actor.input, actor_id)?;
+    }
     let (_binding_id, key_id) = store
         .get_actor_key_binding_for_actor(actor_id.as_bytes())?
         .ok_or_else(|| {
@@ -7042,6 +11126,157 @@ fn bind_cloned_ledger_actor(
     Ok(updated)
 }
 
+fn local_actor_registry_entry(
+    environment: &UserEnvironment,
+    reference: &str,
+) -> Result<ActorRegistryEntry, Box<dyn std::error::Error>> {
+    let registry = load_actor_registry(environment)?;
+    let stem = actor_artifact_stem(reference);
+    let matches = registry
+        .actors
+        .iter()
+        .filter(|(key, entry)| {
+            key.as_str() == stem
+                || entry.actor_id == reference
+                || entry.name == reference
+                || entry.alias.as_deref() == Some(reference)
+        })
+        .map(|(_, entry)| entry.clone())
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [entry] => Ok(entry.clone()),
+        [] => Err(user_error(format!(
+            "local actor identity not found: {reference}"
+        ))),
+        entries => Err(user_error(format!(
+            "multiple local actor identities match {reference}: {}; use --as <actor-id>",
+            entries
+                .iter()
+                .map(|entry| entry.actor_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+fn actor_request_identity_objects(
+    actor: ActorRequestIdentity,
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    let actor_id = uuid::Uuid::parse_str(&actor.actor_id)?;
+    let entry = actor_request_ledger_entry(&actor);
+    let bundle = fact_sdk::workflow::export_identity_for_actor(&entry, actor_id)?.bundle;
+    Ok(fact_commitment::decode_bundle(&bundle)
+        .map_err(|error| user_error(error.to_string()))?
+        .objects)
+}
+
+fn validate_local_actor_identity(
+    reference: &str,
+    actor_id: uuid::Uuid,
+    expected_actor_id: Option<uuid::Uuid>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(expected_actor_id) = expected_actor_id {
+        if actor_id != expected_actor_id {
+            return Err(user_error(format!(
+                "local actor {reference} is {actor_id}, not {expected_actor_id}; use --as <actor-id>"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn registry_actor_request_identity_for_reference(
+    environment: &UserEnvironment,
+    reference: &str,
+) -> Result<ActorRequestIdentity, Box<dyn std::error::Error>> {
+    local_actor_registry_entry(environment, reference)
+        .map(|local| registry_actor_request_identity(environment, local))
+}
+
+fn local_actor_request_identity(
+    environment: &UserEnvironment,
+    reference: &str,
+    actor_id: Option<uuid::Uuid>,
+) -> Result<Option<ActorRequestIdentity>, Box<dyn std::error::Error>> {
+    if let Some(local) = directory_actor_request_identity(environment, reference, None)? {
+        let local_actor_id = uuid::Uuid::parse_str(&local.actor_id)?;
+        validate_local_actor_identity(reference, local_actor_id, actor_id)?;
+        return Ok(Some(local));
+    }
+    let registry = match registry_actor_request_identity_for_reference(environment, reference) {
+        Ok(local) => Some(local),
+        Err(_) => actor_id
+            .map(|actor_id| {
+                registry_actor_request_identity_for_reference(environment, &actor_id.to_string())
+            })
+            .transpose()?,
+    };
+    if let Some(local) = registry {
+        let local_actor_id = uuid::Uuid::parse_str(&local.actor_id)?;
+        validate_local_actor_identity(reference, local_actor_id, actor_id)?;
+        return Ok(Some(local));
+    }
+    Ok(None)
+}
+
+fn import_local_actor_identity_into_clone(
+    environment: &UserEnvironment,
+    clone_entry: &LedgerEntry,
+    reference: &str,
+    actor_id: uuid::Uuid,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let local = local_actor_request_identity(environment, reference, Some(actor_id))?
+        .ok_or_else(|| user_error(format!("local actor identity not found: {reference}")))?;
+    let bundle = fact_sdk::workflow::export_identity_for_actor(
+        &actor_request_ledger_entry(&local),
+        actor_id,
+    )?
+    .bundle;
+    fact_sdk::workflow::import_identity(clone_entry, &bundle)?;
+    Ok(())
+}
+
+fn local_actor_identity_objects(
+    environment: &UserEnvironment,
+    actor: &CloneActorBinding,
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    let Some(local) = local_actor_request_identity(environment, &actor.input, actor.actor_id)?
+    else {
+        return Ok(Vec::new());
+    };
+    actor_request_identity_objects(local)
+}
+
+fn local_actor_identity_objects_not_in(
+    environment: &UserEnvironment,
+    actor: &CloneActorBinding,
+    existing: &[Vec<u8>],
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    let existing_ids = existing
+        .iter()
+        .filter_map(|object| object_id_from_cose(object).ok())
+        .collect::<std::collections::HashSet<_>>();
+    Ok(local_actor_identity_objects(environment, actor)?
+        .into_iter()
+        .filter(|object| {
+            object_id_from_cose(object)
+                .map(|object_id| !existing_ids.contains(&object_id))
+                .unwrap_or(true)
+        })
+        .collect())
+}
+
+fn object_id_from_cose(bytes: &[u8]) -> Result<uuid::Uuid, Box<dyn std::error::Error>> {
+    let payload = fact_crypto::decode_sign1(bytes)?.payload;
+    let value: serde_json::Value = serde_json::from_slice(&payload)?;
+    value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| user_error("signed object is missing id"))?
+        .parse()
+        .map_err(|error| user_error(format!("signed object has invalid id: {error}")))
+}
+
 fn local_identity_seed_file(
     environment: &UserEnvironment,
     actor_id: uuid::Uuid,
@@ -7058,6 +11293,43 @@ fn local_identity_seed_file(
     Err(user_error(format!(
         "local private key material is not available for {actor_id}"
     )))
+}
+
+fn identity_actor_key_id(
+    store: &fact_store::Store,
+    actor_id: uuid::Uuid,
+) -> Result<Option<uuid::Uuid>, Box<dyn std::error::Error>> {
+    if let Some((_, key_id)) = store.get_actor_key_binding_for_actor(actor_id.as_bytes())? {
+        return Ok(Some(key_id));
+    }
+    let actor_text = actor_id.to_string();
+    let key_id = store
+        .list_identity_objects()?
+        .into_iter()
+        .filter(|(_, _, object_type)| object_type == "actor_key_binding")
+        .filter_map(|(binding_id, _, _)| {
+            let bytes = store
+                .get_cose_by_id_any(binding_id.as_bytes())
+                .ok()
+                .flatten()?;
+            let payload = fact_crypto::decode_sign1(&bytes).ok()?.payload;
+            let value = serde_json::from_slice::<serde_json::Value>(&payload).ok()?;
+            let body = value.get("body")?;
+            let binds_actor = body.get("actor_id").and_then(serde_json::Value::as_str)
+                == Some(actor_text.as_str());
+            let signing = body
+                .get("permitted_purpose")
+                .and_then(serde_json::Value::as_str)
+                == Some("signing");
+            if !binds_actor || !signing {
+                return None;
+            }
+            let key_id = body.get("key_id").and_then(serde_json::Value::as_str)?;
+            Some((binding_id, uuid::Uuid::parse_str(key_id).ok()?))
+        })
+        .max_by_key(|(binding_id, _)| *binding_id)
+        .map(|(_, key_id)| key_id);
+    Ok(key_id)
 }
 
 fn actor_capabilities_in_store(
@@ -7867,6 +12139,12 @@ fn sdk_tag_match(match_mode: TagMatch) -> fact_sdk::workflow::TagSearchMatch {
 
 fn short_uuid(value: uuid::Uuid) -> String {
     fact_sdk::reference::short_uuid_reference(value)
+}
+
+fn short_uuid_string(value: &str) -> String {
+    uuid::Uuid::parse_str(value)
+        .map(short_uuid)
+        .unwrap_or_else(|_| value.to_owned())
 }
 
 fn parse_tag_operation(action: &str) -> Result<fact_sdk::workflow::TagOperation, Box<dyn Error>> {
@@ -8894,4 +13172,10 @@ fn parse_uuid7(value: &str, field: &str) -> Result<uuid::Uuid, Box<dyn std::erro
         return Err(format!("{field} must be lowercase canonical UUIDv7").into());
     }
     Ok(uuid)
+}
+
+fn resolve_ledger_uuid(value: &str) -> Result<uuid::Uuid, Box<dyn std::error::Error>> {
+    let environment = UserEnvironment::discover()?;
+    let ledger = environment.resolve_ledger_id(value)?;
+    parse_uuid7(&ledger, "ledger")
 }
